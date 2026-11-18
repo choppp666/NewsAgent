@@ -374,3 +374,79 @@ def test_save_briefing_runs_without_user_service_error(ctx: ToolContext) -> None
     assert result.error is not None
 
     assert isinstance(NotFoundError("x"), Exception)
+
+
+# ---------------------------------------------------------------- Provider 扩展点
+
+
+def _register_fake_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """往注册表塞一个假的搜索服务，用于验证「换搜索服务不用改工具」。"""
+    from datetime import datetime, timedelta
+
+    from app.news import providers as providers_module
+    from app.news.providers import ProviderResult, SourceReport
+    from app.news.rss import FeedItem
+
+    class FakeProvider:
+        name = "fake"
+
+        def search(self, sources=None):  # noqa: ANN001, ANN201 - 协议实现
+            return ProviderResult(
+                items=[
+                    FeedItem(
+                        title="AI Agent 平台新增工具调用编排能力",
+                        link="https://example.com/fake-agent-news",
+                        summary="示例摘要：面向 AI Agent 的工具调用编排。",
+                        # 取窗口内的时间："today" 的上界是解析时刻，用 now() 会差几微秒落到窗口外
+                        published_at=datetime.now() - timedelta(minutes=30),
+                        published_raw="",
+                        source_id="fake",
+                        source_name="Fake News",
+                    )
+                ],
+                sources=[SourceReport("fake", "Fake News", ok=True, item_count=1)],
+            )
+
+    monkeypatch.setitem(providers_module._PROVIDERS, "fake", FakeProvider())
+
+
+def test_search_news_uses_registered_provider(ctx: ToolContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    """注册新搜索服务后，search_news 真的会走它——provider 不是装饰性参数。"""
+    _register_fake_provider(monkeypatch)
+
+    result = run_tool(
+        "search_news",
+        {"keyword": "AI Agent", "date_range": "today", "provider": "fake"},
+        ctx,
+    )
+
+    assert result.ok
+    assert result.data["provider"] == "fake"
+    assert result.data["items"][0]["url"] == "https://example.com/fake-agent-news"
+    assert result.meta["provider"] == "fake"
+
+
+def test_search_news_provider_comes_from_settings(ctx: ToolContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    """不传 provider 时读 NEWS_PROVIDER 配置，便于整站切换搜索后端。"""
+    from app.agent.tools import news as news_tools
+
+    _register_fake_provider(monkeypatch)
+    monkeypatch.setattr(news_tools.settings, "NEWS_PROVIDER", "fake")
+
+    result = run_tool("search_news", {"keyword": "AI Agent", "date_range": "today"}, ctx)
+
+    assert result.ok
+    assert result.data["provider"] == "fake"
+
+
+def test_search_news_unknown_provider_falls_back_to_rss(ctx: ToolContext, news_network) -> None:
+    """配了一个不存在的 provider 名：回退到 rss，而不是让整个搜索失败。"""
+    result = run_tool(
+        "search_news",
+        {"keyword": "AI Agent", "date_range": "today", "provider": "no-such-provider"},
+        ctx,
+    )
+
+    assert result.ok
+    assert result.data["provider"] == "rss"
+    assert result.data["items"]

@@ -14,6 +14,12 @@ pydantic-settings==2.7.0
 email-validator==2.2.0
 python-dotenv==1.0.1
 
+# ---- 第四阶段：定时任务 ----
+# APScheduler 3.x 的 AsyncIOScheduler 可直接运行在 FastAPI 的事件循环里
+apscheduler==3.10.4
+
 # ---- 开发/测试（可选）----
 httpx==0.28.1
 pytest==8.3.4
+# 可选：只用于 scripts/ui_check_stage4.py 的前端自动化验收（复用本机 Edge/Chrome，无需下载浏览器）
+# playwright>=1.40

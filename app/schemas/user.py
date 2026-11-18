@@ -58,6 +58,7 @@ class UserOut(BaseModel):
     nickname: str = Field(..., description="用户昵称")
     identity: str = Field(..., description="身份或职业描述")
     email: str | None = Field(default=None, description="新闻接收邮箱")
+    push_enabled: bool = Field(default=True, description="是否接收邮件推送")
     created_at: datetime = Field(..., description="创建时间")
     updated_at: datetime = Field(..., description="更新时间")
 

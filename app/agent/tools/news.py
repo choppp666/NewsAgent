@@ -94,6 +94,13 @@ class SearchNewsArgs(BaseModel):
         default_factory=list,
         description=f"限定检索的源 ID，留空表示全部；可用：{', '.join(list_feed_ids())}",
     )
+    provider: str | None = Field(
+        default=None,
+        description=(
+            "搜索提供方名称，留空使用服务端配置（默认 rss）。"
+            "一般不需要填写，仅在服务端另外注册了搜索服务（如 websearch / newsapi）时才用得上。"
+        ),
+    )
     max_items: int = Field(
         default=12,
         ge=1,
@@ -206,7 +213,9 @@ def search_news(args: SearchNewsArgs, ctx: ToolContext) -> ToolResult:
     if not query.tokens:
         return ToolResult.failure(tool="search_news", code=ERR_INVALID_ARGUMENTS, message="关键词不能为空")
 
-    provider = get_provider("rss")
+    # provider 由配置/参数决定：默认 rss，注册了新搜索服务后改这一处即可切换，
+    # 工具签名、Agent 主循环与 prompt 都不用动。
+    provider = get_provider(args.provider or settings.NEWS_PROVIDER)
     result = provider.search(args.sources or None)
 
     if not result.sources:
@@ -340,6 +349,7 @@ def search_news(args: SearchNewsArgs, ctx: ToolContext) -> ToolResult:
     payload = {
         "keyword": args.keyword,
         "date_range": window.to_dict(),
+        "provider": provider.name,
         "items": selected,
         "stats": stats,
         "duplicates": duplicates[:10],

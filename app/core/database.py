@@ -87,11 +87,17 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
-    """创建所有数据表（幂等，表已存在时不会重复创建）。
+    """创建所有数据表（幂等，表已存在时不会重复创建），并补齐新增列。
 
     必须先 import 模型模块，让它们注册到 Base.metadata 上。
+    建表之后调用 `sync_schema()`：`create_all` 只建不改，
+    第四阶段给老表加的列（如 users.push_enabled）需要单独补。
     """
     from app import models  # noqa: F401  # 触发模型注册
+    from app.core.migrations import sync_schema
 
     Base.metadata.create_all(bind=engine)
+    applied = sync_schema(engine)
+    if applied:
+        logger.info("schema 已补齐：%s", "、".join(applied))
     logger.info("数据库初始化完成：%s", settings.DATABASE_URL)

@@ -6,11 +6,19 @@
 
 from app.models.base import BaseEntityMixin, local_now
 from app.models.briefing import NewsBriefing
+from app.models.push import PUSH_STATUS_VALUES, PushChannel, PushRecord, PushStatus
 from app.models.subscription import (
     TERM_TYPE_VALUES,
     Subscription,
     SubscriptionTerm,
     TermType,
+)
+from app.models.task import (
+    TASK_STATUS_VALUES,
+    TRIGGER_TYPE_VALUES,
+    GenerationTask,
+    TaskStatus,
+    TriggerType,
 )
 from app.models.user import User
 
@@ -23,4 +31,13 @@ __all__ = [
     "TermType",
     "TERM_TYPE_VALUES",
     "NewsBriefing",
+    "GenerationTask",
+    "TaskStatus",
+    "TriggerType",
+    "TASK_STATUS_VALUES",
+    "TRIGGER_TYPE_VALUES",
+    "PushRecord",
+    "PushStatus",
+    "PushChannel",
+    "PUSH_STATUS_VALUES",
 ]

@@ -64,6 +64,23 @@ def client(engine: Engine) -> Generator[TestClient, None, None]:
 
 
 @pytest.fixture()
+def session_factory(engine: Engine, monkeypatch: pytest.MonkeyPatch):
+    """把全局 `SessionLocal` 指向临时库。
+
+    第四阶段的后台任务 / 推送 / 调度作业都用「自己开会话」的方式工作
+    （`from app.core.database import SessionLocal`，函数内导入），
+    如果不替换，测试会写到真实的 data/news_agent.db 里。
+    这里 monkeypatch 模块属性，覆盖所有延迟导入点。
+    """
+    TestingSession = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+    import app.core.database as database_module
+
+    monkeypatch.setattr(database_module, "SessionLocal", TestingSession)
+    return TestingSession
+
+
+@pytest.fixture()
 def user_id(client: TestClient) -> int:
     """预置一个用户，返回其 ID。"""
     response = client.post(

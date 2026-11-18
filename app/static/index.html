@@ -3,182 +3,302 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AI 新闻助手 · 订阅配置</title>
+  <title>AI 新闻助手 · 每日简报</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <link rel="stylesheet" href="/css/style.css" />
 </head>
 <body>
   <div class="page">
-    <!-- ==================== 顶部区域 ==================== -->
+    <!-- ==================== 顶部导航 ==================== -->
     <header class="hero">
       <div class="hero-top">
         <div class="brand">
           <div class="brand-logo">AI</div>
           <div class="brand-text">
             <h1>每日 AI 新闻助手</h1>
-            <p>填写身份与关注偏好，Agent 每天按你的口味筛选新闻</p>
+            <p>定时采集 · 个性化筛选 · 邮件推送 · 历史简报</p>
           </div>
         </div>
-        <div class="user-chip" id="userChip" title="当前浏览器关联的用户">
-          <span class="chip-dot"></span>
-          <span id="userChipText">尚未创建配置</span>
+        <div class="hero-right">
+          <nav class="tabs" id="mainNav" aria-label="主导航">
+            <a class="tab" href="#/" data-route="dashboard">概览</a>
+            <a class="tab" href="#/briefings" data-route="history">历史简报</a>
+            <a class="tab" href="#/settings" data-route="settings">订阅配置</a>
+          </nav>
+          <div class="user-chip" id="userChip" title="当前浏览器关联的用户">
+            <span class="chip-dot"></span>
+            <span id="userChipText">尚未创建配置</span>
+          </div>
         </div>
       </div>
-
-      <ol class="steps" aria-label="配置流程">
-        <li class="step is-active"><span>1</span>填写基本信息</li>
-        <li class="step"><span>2</span>设置关注偏好</li>
-        <li class="step"><span>3</span>保存订阅</li>
-      </ol>
     </header>
 
-    <!-- ==================== 主体表单 ==================== -->
-    <main class="grid">
-      <!-- ---------- 卡片一：用户信息 ---------- -->
-      <section class="card" aria-labelledby="profileTitle">
+    <!-- ============================================================
+         视图一：概览
+         ============================================================ -->
+    <section class="view" id="view-dashboard" hidden>
+      <div class="grid grid--dash">
+        <!-- 用户基本信息 -->
+        <section class="card" aria-labelledby="userCardTitle">
+          <div class="card-head">
+            <h2 id="userCardTitle">用户信息</h2>
+            <p class="card-desc">来自第一阶段填写的基本资料</p>
+          </div>
+          <dl class="kv" id="userInfo">
+            <dt>昵称</dt><dd id="dashNickname">—</dd>
+            <dt>身份</dt><dd id="dashIdentity">—</dd>
+            <dt>接收邮箱</dt><dd id="dashEmail">—</dd>
+            <dt>用户 ID</dt><dd id="dashUserId">—</dd>
+          </dl>
+          <div class="card-actions">
+            <a class="btn btn-ghost" href="#/settings">修改订阅偏好</a>
+          </div>
+        </section>
+
+        <!-- 推送设置 -->
+        <section class="card" aria-labelledby="pushCardTitle">
+          <div class="card-head">
+            <h2 id="pushCardTitle">邮件推送</h2>
+            <p class="card-desc">关闭后简报仍照常生成，只是不再发信</p>
+          </div>
+          <div class="switch-row">
+            <label class="switch">
+              <input type="checkbox" id="pushToggle" />
+              <span class="switch-track"><span class="switch-thumb"></span></span>
+              <span class="switch-label" id="pushToggleLabel">接收邮件推送</span>
+            </label>
+          </div>
+          <p class="hint" id="pushHint">—</p>
+        </section>
+
+        <!-- 当前订阅偏好 -->
+        <section class="card card--wide" aria-labelledby="prefCardTitle">
+          <div class="card-head">
+            <h2 id="prefCardTitle">当前订阅偏好</h2>
+            <p class="card-desc" id="prefUpdatedAt">—</p>
+          </div>
+          <div class="pref-summary" id="prefSummary"></div>
+        </section>
+      </div>
+
+      <!-- 生成操作区 -->
+      <section class="card card--wide gen-card" aria-labelledby="genTitle">
         <div class="card-head">
-          <h2 id="profileTitle">基本信息</h2>
-          <p class="card-desc">用于生成简报时的称呼与内容深度参考</p>
+          <h2 id="genTitle">生成今日简报</h2>
+          <p class="card-desc">
+            点击后由 Agent 自主检索新闻、筛选、撰写并入库；期间可以离开页面，回来仍能看到进度
+          </p>
         </div>
 
-        <form id="profileForm" class="form" novalidate>
-          <div class="field">
-            <label for="nickname">昵称 <span class="required">*</span></label>
-            <input
-              type="text"
-              id="nickname"
-              name="nickname"
-              maxlength="50"
-              placeholder="例如：小林"
-              autocomplete="nickname"
-            />
-            <p class="hint">1 ~ 50 个字符，必填</p>
+        <div class="gen-bar">
+          <div class="gen-meta">
+            <span class="gen-state" id="genState">今日尚未生成</span>
+            <span class="gen-sub" id="genSub">点击右侧按钮开始</span>
           </div>
+          <div class="gen-actions">
+            <button type="button" class="btn btn-ghost" id="refreshBtn">刷新</button>
+            <button type="button" class="btn btn-primary" id="genBtn" disabled>
+              <span class="btn-label">立即生成简报</span>
+              <span class="spinner" aria-hidden="true"></span>
+            </button>
+          </div>
+        </div>
 
-          <div class="field">
-            <label for="identity">身份 / 职业描述 <span class="required">*</span></label>
-            <textarea
-              id="identity"
-              name="identity"
-              rows="3"
-              maxlength="200"
-              placeholder="例如：后端开发实习生，主攻 Java / Spring Boot，正在学习大模型应用开发"
-            ></textarea>
-            <p class="hint">描述越具体，后续简报的技术侧重越准确（1 ~ 200 字）</p>
-          </div>
+        <!-- 执行阶段指示：等待执行 → 正在生成 → 成功 / 失败 -->
+        <ol class="phase-steps" id="phaseSteps" hidden>
+          <li class="phase" data-phase="pending"><span class="phase-dot"></span>等待执行</li>
+          <li class="phase" data-phase="running"><span class="phase-dot"></span>正在生成</li>
+          <li class="phase" data-phase="done"><span class="phase-dot"></span>完成</li>
+        </ol>
 
-          <div class="field">
-            <label for="email">接收邮箱 <span class="optional">选填</span></label>
-            <input
-              type="email"
-              id="email"
-              name="email"
-              maxlength="255"
-              placeholder="you@example.com"
-              autocomplete="email"
-            />
-            <p class="hint">后续阶段的邮件推送会发往该邮箱，可暂时留空</p>
-          </div>
-        </form>
+        <div class="gen-progress" id="genProgress" hidden>
+          <div class="progress-track"><i class="progress-fill"></i></div>
+          <p class="progress-text" id="progressText">正在排队…</p>
+        </div>
+
+        <div class="gen-result" id="genResult" hidden></div>
       </section>
 
-      <!-- ---------- 卡片二：订阅偏好 ---------- -->
-      <section class="card" aria-labelledby="prefTitle">
+      <div class="grid grid--dash">
+        <!-- 最近一次简报 -->
+        <section class="card" aria-labelledby="latestBriefingTitle">
+          <div class="card-head">
+            <h2 id="latestBriefingTitle">最近一次简报</h2>
+            <p class="card-desc">生成后可直接查看完整内容</p>
+          </div>
+          <div id="latestBriefing" class="latest-block">
+            <p class="empty">还没有生成过简报</p>
+          </div>
+        </section>
+
+        <!-- 最近一次推送 -->
+        <section class="card" aria-labelledby="latestPushTitle">
+          <div class="card-head">
+            <h2 id="latestPushTitle">最近一次推送</h2>
+            <p class="card-desc">失败可单独重试，不需要重新生成</p>
+          </div>
+          <div id="latestPush" class="latest-block">
+            <p class="empty">还没有推送记录</p>
+          </div>
+        </section>
+      </div>
+
+      <!-- 定时任务状态 -->
+      <section class="card card--wide" aria-labelledby="schedTitle">
         <div class="card-head">
-          <h2 id="prefTitle">订阅偏好</h2>
-          <p class="card-desc">输入后按 <kbd>Enter</kbd> 或 <kbd>,</kbd> 添加，点击标签上的 × 可删除</p>
+          <h2 id="schedTitle">定时任务</h2>
+          <p class="card-desc">由 APScheduler 每天固定时间自动为所有用户生成简报</p>
+        </div>
+        <ul class="stat-row" id="schedStats"></ul>
+      </section>
+    </section>
+
+    <!-- ============================================================
+         视图二：历史简报列表
+         ============================================================ -->
+    <section class="view" id="view-history" hidden>
+      <section class="card card--wide" aria-labelledby="historyTitle">
+        <div class="card-head">
+          <h2 id="historyTitle">历史简报</h2>
+          <p class="card-desc">每天的生成与推送状态都在这里，点「查看」阅读完整简报</p>
         </div>
 
-        <div class="field">
-          <label>关注领域 <span class="optional">最多 20 个</span></label>
-          <div class="tag-field" data-field="topics">
-            <ul class="tag-list" id="topicsList"></ul>
-            <input type="text" id="topicsInput" placeholder="例如：大模型、多模态、AI Agent" />
+        <div class="table" id="historyTable">
+          <div class="table-head">
+            <span>日期</span>
+            <span>简报标题</span>
+            <span class="ta-c">新闻数</span>
+            <span class="ta-c">生成状态</span>
+            <span class="ta-c">推送状态</span>
+            <span class="ta-r">操作</span>
           </div>
-          <div class="preset-row" id="presetRow">
-            <span class="preset-label">快速添加：</span>
-            <!-- 预设标签由 JS 渲染 -->
-          </div>
+          <div id="historyBody" class="table-body"></div>
         </div>
 
-        <div class="field">
-          <label>关键词 <span class="optional">最多 50 个</span></label>
-          <div class="tag-field" data-field="keywords">
-            <ul class="tag-list" id="keywordsList"></ul>
-            <input type="text" id="keywordsInput" placeholder="例如：RAG、微调、推理成本" />
-          </div>
-          <p class="hint">命中任意关键词的新闻会被优先纳入简报</p>
+        <div class="table-empty" id="historyEmpty" hidden>
+          <p>还没有任何简报记录。</p>
+          <a class="btn btn-primary" href="#/">去生成第一份 →</a>
         </div>
 
-        <div class="field">
-          <label>排除关键词 <span class="optional">最多 50 个</span></label>
-          <div class="tag-field tag-field--exclude" data-field="exclude_keywords">
-            <ul class="tag-list" id="excludeKeywordsList"></ul>
-            <input type="text" id="excludeKeywordsInput" placeholder="例如：招聘、课程广告、币圈" />
-          </div>
-          <p class="hint">含这些词的新闻将被直接过滤，避免噪音</p>
+        <div class="pager" id="historyPager" hidden>
+          <button type="button" class="btn btn-ghost" id="prevPage">上一页</button>
+          <span class="pager-text" id="pagerText">第 1 页</span>
+          <button type="button" class="btn btn-ghost" id="nextPage">下一页</button>
         </div>
       </section>
-    </main>
+    </section>
 
-    <!-- ==================== 操作区 ==================== -->
-    <div class="actions">
-      <div class="actions-meta">
-        <span class="status" id="saveStatus">信息尚未保存</span>
-        <button type="button" class="btn btn-ghost" id="resetBtn">新建一份配置</button>
-      </div>
-      <div class="actions-btns">
-        <a class="btn btn-link" href="/docs" target="_blank" rel="noopener">接口文档 ↗</a>
-        <button type="button" class="btn btn-primary" id="saveBtn">
-          <span class="btn-label">保存订阅</span>
-          <span class="spinner" aria-hidden="true"></span>
-        </button>
-      </div>
-    </div>
-
-    <!-- ==================== 今日简报 ==================== -->
-    <section class="card card--wide briefing" id="briefingCard" aria-labelledby="briefingTitle">
-      <div class="card-head">
-        <h2 id="briefingTitle">今日简报</h2>
-        <p class="card-desc">
-          Agent 会自己决定搜哪些词、搜几次、读不读原文，最终产出结构化简报并入库
-        </p>
-      </div>
-
-      <div class="briefing-bar">
-        <div class="briefing-meta">
-          <span class="briefing-state" id="briefingState">尚未生成</span>
-          <span class="briefing-sub" id="briefingSub">保存订阅偏好后即可生成</span>
+    <!-- ============================================================
+         视图三：简报详情
+         ============================================================ -->
+    <section class="view" id="view-detail" hidden>
+      <section class="card card--wide" aria-labelledby="detailTitle">
+        <div class="detail-head">
+          <a class="back-link" href="#/briefings">← 返回历史简报</a>
+          <div class="detail-actions">
+            <button type="button" class="btn btn-ghost" id="pushBtn" hidden>重新推送</button>
+            <button type="button" class="btn btn-ghost" id="regenBtn">重新生成</button>
+          </div>
         </div>
-        <button type="button" class="btn btn-primary" id="genBtn" disabled>
-          <span class="btn-label">生成今日简报</span>
-          <span class="spinner" aria-hidden="true"></span>
-        </button>
+
+        <div id="detailMeta" class="detail-meta"></div>
+        <article class="markdown" id="detailBody"></article>
+      </section>
+    </section>
+
+    <!-- ============================================================
+         视图四：订阅配置（第一阶段表单）
+         ============================================================ -->
+    <section class="view" id="view-settings" hidden>
+      <main class="grid">
+        <section class="card" aria-labelledby="profileTitle">
+          <div class="card-head">
+            <h2 id="profileTitle">基本信息</h2>
+            <p class="card-desc">用于生成简报时的称呼与内容深度参考</p>
+          </div>
+
+          <form id="profileForm" class="form" novalidate>
+            <div class="field">
+              <label for="nickname">昵称 <span class="required">*</span></label>
+              <input type="text" id="nickname" name="nickname" maxlength="50"
+                     placeholder="例如：小林" autocomplete="nickname" />
+              <p class="hint">1 ~ 50 个字符，必填</p>
+            </div>
+
+            <div class="field">
+              <label for="identity">身份 / 职业描述 <span class="required">*</span></label>
+              <textarea id="identity" name="identity" rows="3" maxlength="200"
+                        placeholder="例如：后端开发实习生，主攻 Java / Spring Boot，正在学习大模型应用开发"></textarea>
+              <p class="hint">描述越具体，简报的技术侧重越准确（1 ~ 200 字）</p>
+            </div>
+
+            <div class="field">
+              <label for="email">接收邮箱 <span class="optional">选填</span></label>
+              <input type="email" id="email" name="email" maxlength="255"
+                     placeholder="you@example.com" autocomplete="email" />
+              <p class="hint">邮件推送发往该邮箱；留空则只生成不推送</p>
+            </div>
+          </form>
+        </section>
+
+        <section class="card" aria-labelledby="prefTitle">
+          <div class="card-head">
+            <h2 id="prefTitle">订阅偏好</h2>
+            <p class="card-desc">输入后按 <kbd>Enter</kbd> 或 <kbd>,</kbd> 添加，点击标签上的 × 可删除</p>
+          </div>
+
+          <div class="field">
+            <label>关注领域 <span class="optional">最多 20 个</span></label>
+            <div class="tag-field" data-field="topics">
+              <ul class="tag-list" id="topicsList"></ul>
+              <input type="text" id="topicsInput" placeholder="例如：大模型、多模态、AI Agent" />
+            </div>
+            <div class="preset-row" id="presetRow">
+              <span class="preset-label">快速添加：</span>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>关键词 <span class="optional">最多 50 个</span></label>
+            <div class="tag-field" data-field="keywords">
+              <ul class="tag-list" id="keywordsList"></ul>
+              <input type="text" id="keywordsInput" placeholder="例如：RAG、微调、推理成本" />
+            </div>
+            <p class="hint">命中任意关键词的新闻会被优先纳入简报</p>
+          </div>
+
+          <div class="field">
+            <label>排除关键词 <span class="optional">最多 50 个</span></label>
+            <div class="tag-field tag-field--exclude" data-field="exclude_keywords">
+              <ul class="tag-list" id="excludeKeywordsList"></ul>
+              <input type="text" id="excludeKeywordsInput" placeholder="例如：招聘、课程广告、币圈" />
+            </div>
+            <p class="hint">含这些词的新闻将被直接过滤，避免噪音</p>
+          </div>
+        </section>
+      </main>
+
+      <div class="actions">
+        <div class="actions-meta">
+          <span class="status" id="saveStatus">信息尚未保存</span>
+          <button type="button" class="btn btn-ghost" id="resetBtn">新建一份配置</button>
+        </div>
+        <div class="actions-btns">
+          <a class="btn btn-link" href="/docs" target="_blank" rel="noopener">接口文档 ↗</a>
+          <button type="button" class="btn btn-primary" id="saveBtn">
+            <span class="btn-label">保存订阅</span>
+            <span class="spinner" aria-hidden="true"></span>
+          </button>
+        </div>
       </div>
-
-      <!-- 生成中的进度 -->
-      <div class="briefing-progress" id="briefingProgress" hidden>
-        <div class="progress-track"><i class="progress-fill"></i></div>
-        <p class="progress-text" id="progressText">正在读取订阅偏好…</p>
-        <p class="hint">
-          真实模型需要 1~3 分钟（会真的去抓 RSS 与正文），期间请勿关闭页面
-        </p>
-      </div>
-
-      <!-- 生成后的运行摘要 -->
-      <ul class="briefing-stats" id="briefingStats" hidden></ul>
-
-      <!-- 简报正文（Markdown 渲染） -->
-      <article class="markdown" id="briefingBody" hidden></article>
     </section>
 
     <footer class="footer">
-      <span>第三阶段 · 新闻采集、个性化筛选与简报生成</span>
-      <span>定时任务与消息推送将在后续阶段接入</span>
+      <span>第四阶段 · 定时任务 · 邮件推送 · 历史简报管理</span>
+      <span id="footerSched">—</span>
     </footer>
   </div>
 
-  <!-- 轻提示 -->
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <script src="/js/app.js"></script>

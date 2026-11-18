@@ -40,6 +40,16 @@ def list_all(db: Session, *, offset: int = 0, limit: int = 100) -> tuple[list[Us
     return list(db.scalars(stmt).all()), total
 
 
+def list_ids(db: Session) -> list[int]:
+    """全部用户 ID（定时任务遍历用户用）。
+
+    只取主键而不是整行对象：定时任务只需要「为哪些用户跑」，
+    逐个读取用户画像的工作交给任务执行阶段，避免一次把几十个用户对象加载进内存。
+    """
+    return [row for row in db.scalars(select(User.id).order_by(User.id.asc())).all()]
+
+
+
 def update(db: Session, user: User, values: dict) -> User:
     """按字段字典更新用户（未提交）。"""
     for field, value in values.items():

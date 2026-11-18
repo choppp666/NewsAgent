@@ -74,3 +74,32 @@ def update_user(db: Session, user_id: int, payload: UserUpdate) -> User:
     db.refresh(user)
     logger.info("更新用户成功: id=%s fields=%s", user.id, list(values.keys()))
     return user
+
+
+def update_push_settings(db: Session, user_id: int, enabled: bool) -> User:
+    """打开 / 关闭某用户的邮件推送。
+
+    只改意愿，不动邮箱。关闭后定时任务照常生成简报并入库——
+    「不想被打扰」和「不想积累」是两件事，把生成也停掉会让用户回头看不到历史。
+
+    Args:
+        db: 数据库会话。
+        user_id: 用户 ID。
+        enabled: 是否接收推送。
+
+    Returns:
+        更新后的用户对象。
+
+    Raises:
+        NotFoundError: 用户不存在。
+    """
+    user = get_user(db, user_id)
+    if bool(user.push_enabled) == bool(enabled):
+        return user
+
+    user.push_enabled = bool(enabled)
+    db.commit()
+    db.refresh(user)
+    logger.info("用户 %s 邮件推送已%s", user_id, "开启" if enabled else "关闭")
+    return user
+

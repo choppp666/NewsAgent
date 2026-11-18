@@ -7,11 +7,12 @@
 1. 创建应用实例并配置文档；
 2. 注册 CORS、全局异常处理器、v1 路由；
 3. 挂载前端静态资源（SPA 首页）；
-4. 启动时自动建表。
+4. 启动时自动建表、补齐新增列、补建任务记录，并拉起任务 worker 与定时调度器。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -22,10 +23,12 @@ from fastapi.staticfiles import StaticFiles
 from app.api.agent import router as agent_router
 from app.api.v1.router import api_router
 from app.core.config import STATIC_DIR, settings
-from app.core.database import init_db
+from app.core.database import SessionLocal, init_db
 from app.core.exceptions import register_exception_handlers
 from app.core.response import ApiResponse, success
 from app.schemas.common import HealthOut
+from app.scheduler.manager import scheduler_manager
+from app.services.generation_worker import generation_worker
 
 # ---------------------------------------------------------------- 日志配置
 logging.basicConfig(
@@ -36,16 +39,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _backfill_task_records() -> None:
+    """为第三阶段的历史简报补建任务记录（升级对齐，幂等）。"""
+    from app.services import task_service
+
+    try:
+        with SessionLocal() as db:
+            task_service.backfill_from_briefings(db)
+    except Exception:  # noqa: BLE001 - 升级对齐失败不阻断启动
+        logger.warning("补建历史任务记录失败（不影响新任务）", exc_info=True)
+
+
 # ---------------------------------------------------------------- 生命周期
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用启动 / 关闭钩子。
 
-    启动时建表（幂等）。生产环境表结构变更建议改用 Alembic 迁移，
-    本阶段为轻量化考虑，直接使用 create_all。
+    启动顺序是有讲究的：
+    1. 建表 + 补列 —— 后面所有查询都依赖新字段（users.push_enabled）；
+    2. 补建历史任务 —— 让老简报在第四阶段的历史列表里可见；
+    3. 启动 worker —— 先有消费者，再由调度器提交任务，避免任务入队后无人处理；
+    4. 启动调度器 + 启动补跑 —— 补跑在后台执行，不阻塞「服务已就绪」的信号。
     """
     logger.info("正在启动 %s v%s ...", settings.APP_NAME, settings.APP_VERSION)
     init_db()
+    _backfill_task_records()
+
+    await generation_worker.start()
+    await scheduler_manager.start()
+
+    if settings.SCHEDULER_ENABLED and settings.SCHEDULER_CATCH_UP:
+        # 不 await：补跑可能要遍历几十个用户并登记任务，不该让启动卡在这里
+        asyncio.create_task(scheduler_manager.run_catch_up(), name="scheduler-catch-up")
+
     logger.info("启动完成 | 前端首页: / | 接口文档: /docs | 配置默认监听: %s:%s", settings.HOST, settings.PORT)
     logger.info(
         "Agent 已就绪 | 模式=%s | 工作区=%s | 轮数上限=%s | 工具次数上限=%s",
@@ -54,8 +80,23 @@ async def lifespan(app: FastAPI):
         settings.AGENT_MAX_STEPS,
         settings.AGENT_MAX_TOOL_CALLS,
     )
+    logger.info(
+        "定时任务 | 启用=%s 时间=%02d:%02d 时区=%s 并发=%s | 邮件推送=%s（SMTP %s）",
+        settings.SCHEDULER_ENABLED,
+        *settings.scheduler_time_parts,
+        settings.SCHEDULER_TIMEZONE,
+        settings.SCHEDULER_MAX_CONCURRENCY,
+        "启用" if settings.PUSH_ENABLED else "关闭",
+        "已配置" if settings.smtp_configured else "未配置，推送将记为 skipped",
+    )
+
     yield
+
+    # 关闭顺序与启动相反：先停调度器（不再产生新任务），再停 worker
+    await scheduler_manager.shutdown()
+    await generation_worker.stop()
     logger.info("应用已关闭")
+
 
 
 # ---------------------------------------------------------------- 应用实例
@@ -63,12 +104,14 @@ app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     description=(
-        "每日 AI 新闻助手 —— 第三阶段：新闻采集、个性化筛选与简报生成。\n\n"
-        "第一阶段提供用户与订阅偏好管理（/api/v1/*）；"
-        "第二阶段提供 Agent 调试接口（/api/agent/*），支持文件与命令工具；"
-        "第三阶段在同一个 Agent 上新增 search_news / fetch_article / get_user_preferences / save_briefing，"
-        "由模型自行决定搜索策略并生成简报（POST /api/agent/briefings），简报可按用户查询（/api/v1/briefings）。\n"
-        "定时任务与消息推送在后续阶段实现。"
+        "每日 AI 新闻助手 —— 第四阶段：定时任务、邮件推送与历史简报管理。\n\n"
+        "第一阶段提供用户与订阅偏好管理（/api/v1/users、/preferences）；"
+        "第二阶段提供 Agent 核心与调试接口（/api/agent/*）；"
+        "第三阶段新增新闻工具（search_news / fetch_article / get_user_preferences / save_briefing）"
+        "与简报生成（POST /api/agent/briefings）；"
+        "第四阶段把整条链路串成可长期运行的形态：APScheduler 每日定时派发（GET /api/v1/scheduler）、"
+        "任务状态机与幂等控制（POST /api/v1/users/{id}/briefings/trigger、GET /api/v1/tasks）、"
+        "SMTP 邮件推送与失败重试（/api/v1/users/{id}/push-settings、/push-records/{id}/retry）。"
     ),
     lifespan=lifespan,
     docs_url="/docs",
