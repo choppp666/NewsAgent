@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI 新闻助手 · 订阅配置</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <div class="page">
+    <!-- ==================== 顶部区域 ==================== -->
+    <header class="hero">
+      <div class="hero-top">
+        <div class="brand">
+          <div class="brand-logo">AI</div>
+          <div class="brand-text">
+            <h1>每日 AI 新闻助手</h1>
+            <p>填写身份与关注偏好，Agent 每天按你的口味筛选新闻</p>
+          </div>
+        </div>
+        <div class="user-chip" id="userChip" title="当前浏览器关联的用户">
+          <span class="chip-dot"></span>
+          <span id="userChipText">尚未创建配置</span>
+        </div>
+      </div>
+
+      <ol class="steps" aria-label="配置流程">
+        <li class="step is-active"><span>1</span>填写基本信息</li>
+        <li class="step"><span>2</span>设置关注偏好</li>
+        <li class="step"><span>3</span>保存订阅</li>
+      </ol>
+    </header>
+
+    <!-- ==================== 主体表单 ==================== -->
+    <main class="grid">
+      <!-- ---------- 卡片一：用户信息 ---------- -->
+      <section class="card" aria-labelledby="profileTitle">
+        <div class="card-head">
+          <h2 id="profileTitle">基本信息</h2>
+          <p class="card-desc">用于生成简报时的称呼与内容深度参考</p>
+        </div>
+
+        <form id="profileForm" class="form" novalidate>
+          <div class="field">
+            <label for="nickname">昵称 <span class="required">*</span></label>
+            <input
+              type="text"
+              id="nickname"
+              name="nickname"
+              maxlength="50"
+              placeholder="例如：小林"
+              autocomplete="nickname"
+            />
+            <p class="hint">1 ~ 50 个字符，必填</p>
+          </div>
+
+          <div class="field">
+            <label for="identity">身份 / 职业描述 <span class="required">*</span></label>
+            <textarea
+              id="identity"
+              name="identity"
+              rows="3"
+              maxlength="200"
+              placeholder="例如：后端开发实习生，主攻 Java / Spring Boot，正在学习大模型应用开发"
+            ></textarea>
+            <p class="hint">描述越具体，后续简报的技术侧重越准确（1 ~ 200 字）</p>
+          </div>
+
+          <div class="field">
+            <label for="email">接收邮箱 <span class="optional">选填</span></label>
+            <input
+              type="email"
+              id="email"
+              name="email"
+              maxlength="255"
+              placeholder="you@example.com"
+              autocomplete="email"
+            />
+            <p class="hint">第二阶段的邮件推送会发往该邮箱，可暂时留空</p>
+          </div>
+        </form>
+      </section>
+
+      <!-- ---------- 卡片二：订阅偏好 ---------- -->
+      <section class="card" aria-labelledby="prefTitle">
+        <div class="card-head">
+          <h2 id="prefTitle">订阅偏好</h2>
+          <p class="card-desc">输入后按 <kbd>Enter</kbd> 或 <kbd>,</kbd> 添加，点击标签上的 × 可删除</p>
+        </div>
+
+        <div class="field">
+          <label>关注领域 <span class="optional">最多 20 个</span></label>
+          <div class="tag-field" data-field="topics">
+            <ul class="tag-list" id="topicsList"></ul>
+            <input type="text" id="topicsInput" placeholder="例如：大模型、多模态、AI Agent" />
+          </div>
+          <div class="preset-row" id="presetRow">
+            <span class="preset-label">快速添加：</span>
+            <!-- 预设标签由 JS 渲染 -->
+          </div>
+        </div>
+
+        <div class="field">
+          <label>关键词 <span class="optional">最多 50 个</span></label>
+          <div class="tag-field" data-field="keywords">
+            <ul class="tag-list" id="keywordsList"></ul>
+            <input type="text" id="keywordsInput" placeholder="例如：RAG、微调、推理成本" />
+          </div>
+          <p class="hint">命中任意关键词的新闻会被优先纳入简报</p>
+        </div>
+
+        <div class="field">
+          <label>排除关键词 <span class="optional">最多 50 个</span></label>
+          <div class="tag-field tag-field--exclude" data-field="exclude_keywords">
+            <ul class="tag-list" id="excludeKeywordsList"></ul>
+            <input type="text" id="excludeKeywordsInput" placeholder="例如：招聘、课程广告、币圈" />
+          </div>
+          <p class="hint">含这些词的新闻将被直接过滤，避免噪音</p>
+        </div>
+      </section>
+    </main>
+
+    <!-- ==================== 操作区 ==================== -->
+    <div class="actions">
+      <div class="actions-meta">
+        <span class="status" id="saveStatus">信息尚未保存</span>
+        <button type="button" class="btn btn-ghost" id="resetBtn">新建一份配置</button>
+      </div>
+      <div class="actions-btns">
+        <a class="btn btn-link" href="/docs" target="_blank" rel="noopener">接口文档 ↗</a>
+        <button type="button" class="btn btn-primary" id="saveBtn">
+          <span class="btn-label">保存订阅</span>
+          <span class="spinner" aria-hidden="true"></span>
+        </button>
+      </div>
+    </div>
+
+    <footer class="footer">
+      <span>第一阶段 · 项目初始化与用户订阅管理</span>
+      <span>新闻搜索、简报生成与推送将在后续阶段接入</span>
+    </footer>
+  </div>
+
+  <!-- 轻提示 -->
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>

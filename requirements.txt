@@ -1,0 +1,19 @@
+# ---- Web 框架 ----
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# ---- 数据层 ----
+sqlalchemy==2.0.36
+# SQLite 驱动（标准库自带 sqlite3，此依赖仅在需要异步驱动时启用，保留以便后续扩展）
+# aiosqlite==0.20.0
+
+# ---- 配置与校验 ----
+pydantic==2.10.4
+pydantic-settings==2.7.0
+# EmailStr 校验依赖
+email-validator==2.2.0
+python-dotenv==1.0.1
+
+# ---- 开发/测试（可选）----
+httpx==0.28.1
+pytest==8.3.4
