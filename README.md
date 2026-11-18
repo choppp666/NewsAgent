@@ -1,10 +1,11 @@
 # 每日 AI 新闻助手 Agent
 
-一个「按个人口味筛选 AI 新闻」的 Agent 项目。当前完成**第一阶段（用户订阅管理）**与
-**第二阶段（Agent 核心与 Function Calling 工具调用）**——Agent 已经能自己决定调用哪些工具、
-调用几次、什么时候停下来；真实新闻搜索、定时任务与推送仍留待后续阶段。
+一个「按个人口味筛选 AI 新闻」的 Agent 项目。当前完成**第一阶段（用户订阅管理）**、
+**第二阶段（Agent 核心与 Function Calling 工具调用）**与
+**第三阶段（新闻采集、个性化筛选与简报生成）**——Agent 已经能自己决定搜什么词、搜几次、
+读不读原文、什么时候收笔，并把简报写成文件、登记入库；定时任务与消息推送留待后续阶段。
 
-> 技术栈：Python 3.11+ · FastAPI · SQLAlchemy 2.0 · SQLite · 原生 HTML/CSS/JS（无框架、无构建）· OpenAI 兼容 Function Calling
+> 技术栈：Python 3.11+ · FastAPI · SQLAlchemy 2.0 · SQLite · 原生 HTML/CSS/JS（无框架、无构建）· OpenAI 兼容 Function Calling · RSS/Atom（零第三方解析库）
 
 ---
 
@@ -21,8 +22,12 @@
 | **手写 Agent Loop** | ✅ | 多轮 Function Calling：模型决策 → 执行工具 → 结果回填 → 继续决策 → 自主停止 |
 | **安全与护栏** | ✅ | 工作区路径约束、危险命令黑名单、执行超时、输出截断、轮数/次数上限、重复调用提醒 |
 | **调试入口与轨迹** | ✅ | `POST /api/agent/run` 返回完整调用记录；`GET /api/agent/tools` 可查 Schema |
-| 自动化测试 | ✅ | 73 个用例（19 个第一阶段接口 + 54 个工具/Loop/Agent 接口） |
-| 新闻搜索 / 简报生成 / 自动推送 | ⬜ | 后续阶段实现 |
+| **新闻业务工具** | ✅ | search_news / fetch_article / get_user_preferences / save_briefing，与文件工具同一注册表 |
+| **RSS 采集层** | ✅ | 10 个中英文源、并发抓取、单源失败不影响整体、RSS 2.0 / Atom / RDF 全格式 |
+| **个性化筛选** | ✅ | 偏好读库 → 语义判断交给模型；时间窗口、排除词、跨调用去重、标题近似去重由工具兜底 |
+| **简报生成与入库** | ✅ | 结构化 Markdown 校验（章节/条目/链接白名单）+ `news_briefings` 表按「用户+日期」去重 |
+| 自动化测试 | ✅ | 125 个用例（19 接口 + 54 工具/Loop + 26 新闻能力层 + 18 新闻工具 + 8 简报链路） |
+| 定时任务 / 消息推送 | ⬜ | 后续阶段实现 |
 
 ---
 
@@ -40,41 +45,59 @@ NewsAgent/
 │   ├── models/                 # ORM 模型（数据库表的 Python 映射）
 │   │   ├── base.py             # 主键与时间戳 Mixin
 │   │   ├── user.py             # 用户表
-│   │   └── subscription.py     # 订阅头表 + 词条明细表
+│   │   ├── subscription.py     # 订阅头表 + 词条明细表
+│   │   └── briefing.py         # ★ 新闻简报表（user_id + briefing_date 唯一）
 │   ├── schemas/                # Pydantic 请求/响应模型（接口契约 + 参数校验）
 │   │   ├── common.py           # 健康检查等通用结构
 │   │   ├── user.py             # 用户相关
-│   │   └── subscription.py     # 订阅偏好相关（含词条清洗逻辑）
+│   │   ├── subscription.py     # 订阅偏好相关（含词条清洗逻辑）
+│   │   └── briefing.py         # ★ 简报生成/查询契约
 │   ├── crud/                   # 数据访问层：只做数据库读写，不提交事务
 │   │   ├── user.py
-│   │   └── subscription.py
+│   │   ├── subscription.py
+│   │   └── briefing.py         # ★
 │   ├── services/               # 业务服务层：事务边界 + 业务规则
 │   │   ├── user_service.py
-│   │   └── subscription_service.py
+│   │   ├── subscription_service.py
+│   │   └── briefing_service.py # ★ 用户画像 / 任务书 / 简报 upsert
+│   ├── news/                   # ★ 第三阶段：新闻能力层（与 Agent 解耦）
+│   │   ├── feeds.py            # 源目录（ID / 名称 / 语种 / 分类）
+│   │   ├── http.py             # 抓取：UA 伪装、字节上限、SSRF 防护、错误归一
+│   │   ├── rss.py              # RSS 2.0 / Atom / RDF 解析 + 时间归一 + 文本清洗
+│   │   ├── article.py          # 正文抽取：去噪 → 段落 → 密度兜底（full/excerpt/summary）
+│   │   ├── dedupe.py           # URL 规范化 + 标题归一 + 二元组预筛 + 相似度
+│   │   ├── filter.py           # 时间窗口 / 关键词匹配 / 相关度打分 / 排除词
+│   │   ├── providers.py        # 搜索提供方协议 + RSS 实现 + 扩展注册点
+│   │   ├── state.py            # 一次运行内的候选池（跨调用去重 + 链接白名单）
+│   │   └── briefing.py         # 简报结构校验（章节 / 条目 / 链接 / 截断检测）
 │   ├── agent/                  # ★ 第二阶段：Agent 核心
 │   │   ├── registry.py         # 工具注册中心：@tool 装饰器 / Schema 生成 / 动态执行
 │   │   ├── result.py           # ToolResult 统一返回格式（ok/summary/data/error/meta）
-│   │   ├── context.py          # ToolContext：工作区 + 各工具限额
+│   │   ├── context.py          # ToolContext：工作区 + 限额 + 用户/新闻状态/会话工厂
 │   │   ├── safety.py           # 路径约束 / 危险命令拦截 / 环境变量清洗
-│   │   ├── prompts.py          # System Prompt（只写原则，不写步骤）
+│   │   ├── prompts.py          # System Prompt（通用 + 简报专用，只写原则不写步骤）
 │   │   ├── loop.py             # AgentRunner：手写 Function Calling 循环
+│   │   ├── briefing_task.py    # ★ 简报编排：任务书 → 上下文 → 跑循环 → 回读结果
 │   │   ├── tracer.py           # 运行记录与内存环形缓冲
 │   │   ├── schemas.py          # Agent 接口的请求/响应模型
 │   │   ├── tools/
 │   │   │   ├── filesystem.py   # list_dir / read_file / search_content / write_file
-│   │   │   └── shell.py        # bash
+│   │   │   ├── shell.py        # bash
+│   │   │   └── news.py         # ★ search_news / fetch_article / get_user_preferences / save_briefing
 │   │   └── llm/
 │   │       ├── base.py         # LLMClient 协议 + ToolCall / LLMResponse / LLMError
 │   │       ├── openai_client.py# 任意 OpenAI 兼容网关（httpx 直连 + 重试）
 │   │       ├── mock_client.py  # 仅用于离线验证链路的规则化假模型
+│   │       ├── mock_news.py    # ★ 简报场景的离线策略（状态机 + 模板，非模型能力）
 │   │       └── __init__.py     # build_llm_client：auto / openai / mock
 │   ├── api/                    # 接口层
-│   │   ├── agent.py            # ★ /api/agent/run、/tools、/runs
+│   │   ├── agent.py            # ★ /api/agent/run、/briefings、/tools、/runs
 │   │   ├── deps.py             # 公共依赖（会话、user_id → User）
 │   │   └── v1/
 │   │       ├── router.py       # v1 路由聚合
 │   │       ├── users.py        # /api/v1/users
-│   │       └── subscriptions.py# /api/v1/users/{id}/preferences
+│   │       ├── subscriptions.py# /api/v1/users/{id}/preferences
+│   │       └── briefings.py    # ★ /api/v1/briefings（列表 / 详情）
 │   └── static/                 # 前端静态资源（由 FastAPI 直接托管）
 │       ├── index.html
 │       ├── favicon.svg
@@ -82,18 +105,23 @@ NewsAgent/
 │       └── js/app.js
 ├── workspace/                  # ★ Agent 沙箱：所有文件工具与命令的边界
 │   ├── README.md
+│   ├── briefings/              # ★ 生成的简报 Markdown（按「日期-userID.md」命名）
 │   ├── notes/{agent_design.md, todo.md}
 │   ├── src/{agent_runner.py, news_fetcher.py, utils.py}
 │   └── data/sample_news.json
 ├── tests/                      # pytest 测试
-│   ├── conftest.py             # 临时库夹具（不污染开发库）
+│   ├── conftest.py             # 临时库夹具 + 离线新闻网络夹具
 │   ├── test_api.py             # 第一阶段接口
 │   ├── test_tools.py           # 五个工具 + 注册中心 + 安全用例
 │   ├── test_agent_loop.py      # 多轮循环、顺序自由、异常与护栏
-│   └── test_agent_api.py       # /api/agent/* 接口
+│   ├── test_agent_api.py       # /api/agent/* 接口
+│   ├── test_news_core.py       # ★ RSS/正文/去重/时间/简报校验 单元测试
+│   ├── test_news_tools.py      # ★ 四个新闻工具 + 异常场景
+│   └── test_briefing_flow.py   # ★ 双用户端到端 + 同日报简报去重
 ├── scripts/
 │   ├── e2e_check.py            # 可选：Playwright 驱动的前端自动化冒烟测试
-│   └── agent_demo.py           # ★ 三组多步任务的命令行演示
+│   ├── agent_demo.py           # ★ 三组多步任务的命令行演示
+│   └── briefing_demo.py        # ★ 两组用户生成简报的命令行演示
 ├── data/                       # SQLite 数据库文件目录（自动创建，已 gitignore）
 ├── requirements.txt
 ├── .env.example                # 环境变量模板
@@ -356,6 +384,34 @@ curl $BASE/users/1/preferences
 
 支持 <kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>S</kbd> 快捷保存；离开页面前若有未保存修改会提示。
 
+### 今日简报区块（第三阶段新增）
+
+页面下方新增「今日简报」卡片，不用再靠 curl 看结果：
+
+| 元素 | 说明 |
+| --- | --- |
+| 状态行 | 显示「今日尚未生成 / 已生成 · 日期」、条数与生成时间 |
+| 「生成今日简报」按钮 | 未保存用户时禁用；已生成时文案变为「重新生成」 |
+| 进度提示 | 真实模型要跑 1~3 分钟，显示已用秒数；期间按钮转圈且不可重复点击 |
+| 运行摘要 | 生成完成后展示 搜索次数 / 候选条数 / 读原文篇数 / 轮数 / 工具调用 / 耗时 / 模型 |
+| 简报正文 | 前端用 40 行左右的原生 JS 渲染 Markdown（标题、列表、引用、粗体、行内代码、链接） |
+
+两个实现上的注意点：
+
+- **不引第三方 Markdown 库**：页面要求零依赖、内网可离线打开，因此只实现简报用到的语法；
+  渲染前先 `escapeHtml` 再插标签——正文来自大模型，直接塞 `innerHTML` 会有 XSS 风险。
+- **日期用本地时区拼**：`new Date().toISOString()` 是 UTC，晚上 8 点后会把「今天」算成第二天，
+  导致读不到当天简报。改用 `getFullYear/getMonth/getDate` 拼接。
+
+生成接口在 `/api/agent/briefings`（不在 `/api/v1` 下），前端为此给请求封装加了 `base` 参数。
+
+验收时可以直接用 URL 参数指定用户，省去手动改 `localStorage`：
+
+```text
+http://127.0.0.1:8000/?user_id=3    # 用户 A：AI Agent / MCP
+http://127.0.0.1:8000/?user_id=4    # 用户 B：大模型 / AI 编程
+```
+
 ---
 
 ## 七、常见问题与坑位
@@ -591,3 +647,249 @@ python scripts/agent_demo.py                 # 有 key 时自动用真实模型
 | 提示「路径越界」 | 访问了 `workspace/` 之外 | 这是设计行为，把文件放进工作区再操作 |
 | `status=max_steps_reached` | 模型反复调工具停不下来 | 调大 `AGENT_MAX_STEPS`，或把任务描述得更具体 |
 | 运行记录查不到 | 内存环形缓冲只留最近 50 次，重启即清空 | 调整 `AGENT_KEEP_RUNS`；需要持久化则落库 |
+
+---
+
+## 十一、第三阶段：AI 新闻采集、个性化筛选与简报生成
+
+### 11.1 为什么「这仍然是同一个 Agent」
+
+第三阶段**没有**另写一条固定流程，而是给同一个 Agent 加了四个工具、一份专用 prompt：
+
+| 复用点 | 第二阶段 | 第三阶段 | 改动量 |
+| --- | --- | --- | --- |
+| 工具注册中心 | 5 个工具 | 9 个工具（+4 新闻工具） | 新增模块，注册表代码未改 |
+| Agent 主循环 `loop.py` | 文件任务 | 新闻任务 | **只有一处**：允许注入 `system_prompt` |
+| 执行上下文 `ToolContext` | 工作区 + 限额 | +用户 ID / 新闻候选池 / 会话工厂 | 加三个字段 |
+| 轨迹与护栏 | 轮数 / 次数 / 超时 / 重复提醒 | 完全一致（简报场景另配 16 轮 / 40 次） | 0 |
+| Mock 客户端 | 文件意图 | 增加新闻策略分支 | 仅离线验证用 |
+
+判断「是不是固定流程」的标准很直接：**代码里有没有"先搜 A 再搜 B"的编排**。
+本阶段所有搜索角度、搜索次数、是否读原文、何时收笔，都是模型在循环里基于上一轮结果决定的；
+服务端只提供三样东西——工具、护栏、交付物清单。
+
+### 11.2 新闻能力层 `app/news/`
+
+刻意与 Agent 解耦：这一层不 import 任何 `app.agent.*`，因此可以单独测试、单独替换。
+
+| 模块 | 职责 | 关键决策 |
+| --- | --- | --- |
+| `feeds.py` | 10 个源（量子位 / 雷锋网 / 极客公园 / IT之家 / OpenAI / Google AI / HuggingFace / TechCrunch AI / Simon Willison / MarkTechPost） | 源清单属部署配置，放代码 + `NEWS_FEEDS` 覆盖 |
+| `http.py` | 抓取并归一化错误 | 伪装浏览器 UA（多个源默认拒绝 httpx UA）、按字节截断、**不解析域名做 SSRF 判定**（TUN 代理会把域名解析成 198.18.x.x 假 IP，误杀正常请求） |
+| `rss.py` | RSS 2.0 / Atom / RDF 解析 | 标准库 `ElementTree`，零依赖；把 UTC 统一转本地时间（否则「今天」判定错一天）；行内标签删空而不是换空格（中文会变成「这是 摘要 内容」） |
+| `article.py` | 正文抽取 | 去噪 → 取 `<p>/<h2>` → 密度兜底；产出 `full / excerpt / summary / none` 四态，**抓不到就是 none**，不拼接不脑补 |
+| `dedupe.py` | 去重 | URL 规范化（去 utm/fragment/尾斜杠）+ 标题归一 + 二元组预筛 + `SequenceMatcher` |
+| `filter.py` | 时间窗口 / 关键词 / 打分 | 支持 `today / yesterday / last_24h / 3d / 7d / 2026-11-18 / 区间`；英文词边界匹配（`ai` 不命中 `said`） |
+| `providers.py` | 搜索提供方协议 | `RSSNewsProvider` + `register_provider()`，接 NewsAPI/博查/Tavily/模型内置搜索只需新增实现 |
+| `state.py` | 一次运行的候选池 | 跨调用去重 + **链接白名单**（简报链接溯源的技术兜底） |
+| `briefing.py` | 简报结构校验 | 章节 / 头部字段 / 条目链接 / 字数截断检测 |
+
+### 11.3 四个新闻工具
+
+| 工具 | 主要参数 | 做什么 | 护栏 |
+| --- | --- | --- | --- |
+| `get_user_preferences` | `user_id` | 从 SQLite 读身份、话题、关键词、排除词 | 用户不存在 → 404 错误码而非异常 |
+| `search_news` | `keyword`、`date_range`、`exclude_keywords`、`sources`、`max_items`、`only_new` | 多源并发搜索 + 时间过滤 + 排除词 + 去重 + 打分排序 | 全部源失败 → 明确报错并提示「不要编造」；单源失败只作降级记录；结果带 `source_reports` 与 `stats` |
+| `fetch_article` | `url`、`max_chars` | 抓详情页，抽标题/来源/时间/正文 | HTTP 错误、非 HTML、页面无正文、内网地址一律失败并说明；返回 `content_kind` 与 `warnings` |
+| `save_briefing` | `user_id`、`content`、`briefing_date`… | 校验后按「用户+日期」upsert | 结构不全 → 拒收并列出缺失项；链接不在本轮检索结果内 → 拒收并给出可用链接 |
+
+工具描述（LLM 靠它选工具）里写明了幂等语义、能返回什么、什么时候该放弃，例如
+`search_news` 会明确说「一次搜索只覆盖一个关键词，多个主题应分多次搜索」。
+
+### 11.4 个性化筛选：机械判断与语义判断的分工
+
+| 判断类型 | 谁来做 | 例子 |
+| --- | --- | --- |
+| 时间是否在今天 | 工具（`filter.py`） | 昨天 23:59 的新闻不进今日简报 |
+| 是否命中排除词 | 工具 | 用户排除「融资」→ 「完成 3 亿元 B 轮融资」直接过滤 |
+| 是否同一条新闻 | 工具（`state.py` + `dedupe.py`） | 同一篇稿子的 `utm_source` 变体、同标题转载只留一条 |
+| **这条新闻对这个人重不重要** | **模型** | 「Daydream 推出 AI 造型师」字面命中 AI+Agent，但消费级穿搭应用对后端 Agent 开发者价值有限 → 模型应排除 |
+
+为什么语义判断不交给代码：用户关心「AI Agent 落地」，而相关新闻的标题里可能一个「Agent」都没有
+（「某公司发布新工具，可自动完成多步任务」）。工具层越"聪明"，越容易把该给模型的信息提前筛掉。
+搜索工具的作用只是把几百条裁到十几条候选，把判断权留给模型。
+
+`search_news` 的 `stats` 会如实回报每类过滤挡掉了多少条：
+
+```json
+"stats": {"feeds_ok": 10, "feeds_failed": 0, "scanned": 230, "matched": 6,
+          "duplicates_removed": 5, "excluded_by_keyword": 1,
+          "out_of_date_range": 148, "undated": 0, "unmatched": 39}
+```
+
+这样模型知道「是没搜到，还是被过滤掉了」，才能决定「换个词再搜」还是「今天确实没新闻」。
+
+### 11.5 简报生成的三道闸
+
+1. **结构闸**（`parse_briefing`）：必须有 `# 每日 AI 新闻简报`、日期/关注方向/数量三行、
+   `## 今日重点新闻`、`## 行业动态总结`、`## 今日值得关注`，且每条重点新闻都要有链接；
+   字数 < 200 视为被截断。
+2. **溯源闸**（`save_briefing` + `news_state`）：正文里所有 http(s) 链接必须出现在本轮
+   `search_news` / `fetch_article` 的结果里，否则拒收并回传允许的链接清单。
+3. **唯一闸**（数据库）：`UNIQUE(user_id, briefing_date)`。定时任务与手动触发并发写同一天时，
+   应用层的「先查后写」会穿透，唯一键是最后一道闸。
+
+被拒收时工具返回的是**可修复的说明**（缺哪章、哪条没链接、哪几个链接不可信），
+模型据此改写后重提——而不是整个任务失败。
+
+### 11.6 表设计 `news_briefings`
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | INTEGER PK | 简报 ID |
+| `user_id` | FK → users.id，CASCADE | 用户 ID |
+| `briefing_date` | DATE | 简报日期（自然日） |
+| `title` | VARCHAR(200) | 简报标题 |
+| `content` | TEXT | Markdown 全文（以库为准，文件只是导出物） |
+| `news_count` | INTEGER | 条目数 |
+| `generated_at` | DATETIME | 生成时间（重新生成会刷新） |
+| `focus_topics` | JSON | 生成时的关注方向快照（用户偏好之后可能变化） |
+| `file_path` | VARCHAR(255) | 导出的 Markdown 在工作区内的相对路径 |
+| `run_id` | VARCHAR(32) | 对应 Agent 运行 ID，可回溯轨迹 |
+
+去重语义：同一用户同一天只有一行；再次生成执行 UPDATE（覆盖内容、刷新 `generated_at`、`updated_at`）。
+
+### 11.7 接口
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| POST | `/api/agent/briefings` | 生成简报（Agent 自主执行），返回 `run`（轨迹）+ `briefing`（入库结果） |
+| GET | `/api/v1/briefings?user_id=1` | 按用户分页列出（不含正文） |
+| GET | `/api/v1/briefings/{id}` | 简报详情（含 Markdown 全文） |
+| GET | `/api/agent/runs/{run_id}` | 回看该次运行的完整工具调用轨迹 |
+
+```bash
+# 生成（llm_mode 省略则按 AGENT_MODE；mock 为离线策略）
+curl -X POST http://127.0.0.1:8000/api/agent/briefings \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":1,"focus":"MCP 生态"}'
+
+# 查询
+curl "http://127.0.0.1:8000/api/v1/briefings?user_id=1"
+curl http://127.0.0.1:8000/api/v1/briefings/1
+```
+
+响应里的 `run.tool_calls` 就是「Agent 到底干了什么」的证据：
+
+```json
+"tool_calls": [
+  {"index":1,"tool":"get_user_preferences","arguments":{"user_id":1},"ok":true},
+  {"index":2,"tool":"search_news","arguments":{"keyword":"AI Agent","date_range":"today"},"ok":true},
+  {"index":3,"tool":"search_news","arguments":{"keyword":"MCP","date_range":"today"},"ok":true},
+  {"index":4,"tool":"fetch_article","arguments":{"url":"https://..."},"ok":true},
+  {"index":5,"tool":"write_file","arguments":{"path":"briefings/2026-11-18-user1.md"},"ok":true},
+  {"index":6,"tool":"save_briefing","arguments":{"user_id":1},"ok":true}
+]
+```
+
+### 11.8 配置项（第三阶段新增）
+
+| 配置 | 默认值 | 说明 |
+| --- | --- | --- |
+| `NEWS_FEEDS` | 空（用内置 10 个源） | 逗号分隔的源 ID，如 `qbitai,openai` |
+| `NEWS_MAX_ITEMS_PER_FEED` | 30 | 单源最多读取条数 |
+| `NEWS_FETCH_TIMEOUT` | 12.0 | 抓取超时（秒） |
+| `NEWS_HTTP_MAX_BYTES` | 3000000 | 单个响应体上限（OpenAI 的 Feed 有 800KB+） |
+| `NEWS_SEARCH_MAX_ITEMS` | 12 | `search_news` 默认返回上限 |
+| `NEWS_ARTICLE_MAX_CHARS` | 6000 | `fetch_article` 正文上限 |
+| `NEWS_TITLE_SIMILARITY` | 0.9 | 判定「同一条新闻」的标题相似度阈值 |
+| `BRIEFING_OUTPUT_DIR` | `briefings` | 简报在 workspace 内的子目录 |
+| `BRIEFING_MAX_STEPS` | 16 | 简报任务的轮数上限（搜索多，比通用任务宽松） |
+| `BRIEFING_MAX_TOOL_CALLS` | 40 | 简报任务的工具调用上限 |
+| `BRIEFING_RUN_TIMEOUT` | 600 | 简报任务整体超时（秒） |
+
+### 11.9 实测记录
+
+两组用户（`python scripts/briefing_demo.py`，真实 RSS，离线策略）：
+
+| | 用户 A | 用户 B |
+| --- | --- | --- |
+| 身份 | AI Agent 应用开发工程师 | 后端开发工程师 |
+| 关注 | AI Agent、MCP、Agent 框架 / 多智能体、工具调用 | 大模型、AI 编程 / 代码生成、Copilot |
+| Agent 实际搜的词 | `AI Agent` → `MCP` → `Agent 框架` | `大模型` → `AI 编程` → `代码生成` |
+| 轨迹 | 7 次工具调用、8 轮、约 21s | 7 次工具调用、8 轮、约 16s |
+| 结果 | 5 条，覆盖 Agent 编排 / Agentic Search | 5 条，覆盖多模态文档 / 代码生成 |
+
+**真实模型实测（DeepSeek，`--mode openai`）**：同一份代码、同一个 prompt，只换模型，行为立刻分叉——
+
+| | 用户 A（AI Agent / MCP） | 用户 B（大模型 / AI 编程） |
+| --- | --- | --- |
+| 轮数 / 工具调用 | 13 轮 / 22 次 | 10 轮 / 27 次 |
+| 耗时 | 113.6s | 135.6s |
+| 搜索 | 10 次，自己拆出 `MCP Model Context Protocol`、`多智能体 编排`、`agent 工具调用`、`agent framework`、`coding agent sandbox` 等角度 | 16 次，除偏好词外自己补了 `Codex`、`Copilot`、`Claude`、`Gemini`、`SWE-bench`、`Qwen`、`open weights model release` |
+| 读原文 | 7 篇（MarkTechPost ×4、Simon Willison、IT之家、雷锋网） | 6 篇（含 openai.com 一次 HTTP 403） |
+| 候选 / 产出 | 23 条 → 6 条，17.7 KB | 44 条 → 6 条，13.2 KB |
+
+自主决策在两个用户身上的具体表现：
+
+- **A 发现信息缺口后主动换角度**：搜 3 次 MCP 相关词都为空，它没有硬凑，而是改从「Code Mode 的 MCP 谱系」切入，并在简报开头写明「今日没有检索到 MCP 协议本身的直接更新……已在条目中说明」。
+- **B 遇到抓取失败后自行降级**：`fetch_article` 对 `openai.com` 返回 403，它没有编内容，而是改读 MarkTechPost 的同题报道，并在条目里留了一行「备注：OpenAI 官方页面抓取返回 HTTP 403，正文未获取，官方侧信息仅依据其 Feed 摘要」。
+- **两人的重合与分叉都合理**：Code Mode、外部沙箱、Perplexity Multiagent、DeepSeek 计费这 4 条两人都收了，但 A 的落点是「工具编排范式与执行侧隔离」，B 的落点是「编码落地与每任务成本」；第 6 条完全不同的两条（A 收 SID-2 agentic search，B 收 Gemini Neon 爆料）。
+- **检索广度不同**：B 搜了 16 次、攒到 44 条候选才收笔，A 搜 10 次就判定够了——同一个 prompt 下两种不同的收敛策略，说明步数是模型自己定的，不是脚本写死的。
+
+异常场景的覆盖情况（均在 `tests/` 中可复现）：
+
+| 场景 | 触发方式 | 预期与实际行为 |
+| --- | --- | --- |
+| RSS 源访问失败 | `test_search_news_all_sources_down` | `ok=false`，错误码 `news_source_unavailable`，提示「不要编造新闻」 |
+| 部分源失败 | `test_search_news_applies_all_filters` | 不影响结果，`stats.feeds_failed` 如实计数 |
+| 新闻重复 | 同标题转载 + `?utm_source=` 变体 | `duplicates_removed` 计数，只保留一条 |
+| 正文无法获取 | 403 / PDF / 空壳页 / 内网地址 | `article_fetch_failed`，`content_available=false`，提示「请勿编造」 |
+| 当天没有相关新闻 | 冷门主题（量子退火） | 不写文件、不入库，如实说明「没有检索到」 |
+| LLM 内容不完整 | 缺章节 / 缺链接 / 字数过短 | 拒收并列出缺失项，模型可补齐后重提 |
+
+### 11.10 离线策略的边界（重要）
+
+仓库默认可以**不配 Key 就跑通整条链路**：没有 `LLM_API_KEY` 时 `AGENT_MODE=auto`
+会降级到 `mock_news.py` 里的「状态机 + 模板」策略。它和真实模型走的是**同一个
+`AgentRunner`、同一套工具、同一套校验**，区别只在「下一步做什么」由谁决定。
+
+离线策略能证明的是：
+
+- ✅ 工具注册、参数校验、多轮循环、结果回填这条链路对新闻工具同样成立；
+- ✅ 时间过滤、排除词、跨调用去重、正文抓取失败处理都按设计工作；
+- ✅ 简报结构校验、链接溯源、同日去重都生效；
+- ✅ 不同偏好确实产出不同简报。
+
+它**不能**证明的是「模型能自主规划」，具体差异：
+
+| 能力 | 真实模型 | 离线策略 |
+| --- | --- | --- |
+| 搜索角度 | 自行拆同义词、上位概念、中英文表述 | 按偏好词条顺序各搜一次 |
+| 相关性判断 | 语义级（能排除「AI 造型师」这类字面命中） | 关键词字面匹配，会误收 |
+| 摘要与重要性分析 | 基于正文改写 | 从正文截取前两句 + 模板句 |
+| 信息不足时的反应 | 换角度重搜 | 只在候选 < 3 时放宽到 3 天 |
+
+补上 Key 后复跑，代码一行不用改：
+
+```bash
+# .env 里填 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL（任意 OpenAI 兼容网关）
+python scripts/briefing_demo.py --mode openai
+# 或指定单个用户
+python scripts/briefing_demo.py --user A --mode openai
+```
+
+本次用 DeepSeek 实测（配置见 `.env.example`）：`LLM_BASE_URL=https://api.deepseek.com/v1`、
+`LLM_MODEL=deepseek-chat`、`AGENT_MODE=openai`。上表「语义级相关度」这一行在真实模型下得到验证——
+离线版会把《Daydream's new AI agent acts as your personal stylist》（AI 造型师）当成 AI Agent 新闻收进简报，
+真实模型直接把它排除了。
+
+### 11.11 常见问题（第三阶段新增）
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| `search_news` 返回 0 条但明明有新闻 | `date_range=today` 太严，或命中排除词 | 看 `stats` 里的 `out_of_date_range` / `excluded_by_keyword`，换 `3d` 或换词 |
+| 所有源都 403 | UA 被拦，或本机代理拦截 | 已伪装浏览器 UA；检查网络/代理设置 |
+| `fetch_article` 总是 `content_kind=summary` | 站点正文由 JS 渲染（无 `<p>`） | 属预期行为，简报中会标注「正文未获取」 |
+| 简报被拒「链接不在检索结果内」 | 模型自己拼了 URL | 用返回的 `allowed_urls` 改写；这是设计行为 |
+| 同一用户同一天有两条简报 | 唯一键未生效（旧库未迁移） | 删掉旧库或用 `init_db()` 重建；唯一约束在表定义里 |
+| 中文源覆盖偏少 | 机器之心等源已关闭 RSS | 用 `NEWS_FEEDS` 增删；或按 `providers.py` 接入搜索 API |
+| `status=max_steps_reached` | 简报任务搜索过多 | 调大 `BRIEFING_MAX_STEPS`，或在偏好里减少关注词条 |
+
+### 11.12 已知限制
+
+- **跨语言同一事件不去重**：中文和英文媒体对同一事件的报道标题差异大，机械相似度会误杀，
+  交给模型在写作时合并（`prompt` 里已明确要求）。
+- **正文抽取是启发式的**：对纯 JS 渲染站点只能拿到站点摘要，这是「宁可标不确定，也不拼内容」的取舍。
+- **源可用性依赖网络环境**：源的可用状态会变化，`source_reports` 每次都如实回报，便于发现失效源。
+- **无鉴权**：`user_id` 由调用方传入，第四阶段接入 JWT 后应改为「从令牌取用户」。

@@ -2,10 +2,11 @@
 
 from fastapi import APIRouter
 
-from app.api.v1 import subscriptions, users
+from app.api.v1 import briefings, subscriptions, users
 
 api_router = APIRouter()
 api_router.include_router(users.router)
 api_router.include_router(subscriptions.router)
+api_router.include_router(briefings.router)
 
 __all__ = ["api_router"]

@@ -5,6 +5,7 @@
 """
 
 from app.models.base import BaseEntityMixin, local_now
+from app.models.briefing import NewsBriefing
 from app.models.subscription import (
     TERM_TYPE_VALUES,
     Subscription,
@@ -21,4 +22,5 @@ __all__ = [
     "SubscriptionTerm",
     "TermType",
     "TERM_TYPE_VALUES",
+    "NewsBriefing",
 ]

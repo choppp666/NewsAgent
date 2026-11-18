@@ -83,6 +83,7 @@ class AgentRunner:
         max_steps: int | None = None,
         max_tool_calls: int | None = None,
         run_timeout: float | None = None,
+        system_prompt: str | None = None,
     ) -> None:
         self.llm = llm
         self.registry = registry or tool_registry
@@ -92,7 +93,9 @@ class AgentRunner:
         self.run_timeout = run_timeout if run_timeout is not None else settings.AGENT_RUN_TIMEOUT
         # 工具 Schema 只生成一次：每次请求都一样，没必要重复构造
         self._tools_schema = self.registry.openai_tools()
-        self._system_prompt = build_system_prompt(
+        # system prompt 允许外部注入：不同业务场景（文件整理 / 新闻简报）
+        # 需要不同的行为约束，但循环本身完全一致。
+        self._system_prompt = system_prompt or build_system_prompt(
             workspace_name=self.ctx.workspace.name or "workspace",
             tool_names=self.registry.names(),
         )
@@ -115,6 +118,9 @@ class AgentRunner:
         started_at = datetime.now()
         started = time.perf_counter()
         limit_steps = self._resolve_steps(max_steps)
+
+        # 新闻类工具需要把 run_id 写进简报，便于回溯本次轨迹
+        self.ctx.news_state.run_id = run_id
 
         record = RunRecord(
             run_id=run_id,

@@ -32,15 +32,17 @@ def agent_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generato
     yield workspace
 
 
-def test_tools_endpoint_lists_five_tools(client: TestClient) -> None:
+def test_tools_endpoint_lists_all_tools(client: TestClient) -> None:
     response = client.get("/api/agent/tools")
 
     assert response.status_code == 200
     body = response.json()
     assert body["code"] == 0
-    assert body["data"]["total"] == 5
     names = {tool["name"] for tool in body["data"]["tools"]}
-    assert names == {"list_dir", "read_file", "search_content", "write_file", "bash"}
+    assert body["data"]["total"] == len(names)
+    # 文件工具（第二阶段）与新闻工具（第三阶段）由同一个注册中心调度
+    assert {"list_dir", "read_file", "search_content", "write_file", "bash"} <= names
+    assert {"get_user_preferences", "search_news", "fetch_article", "save_briefing"} <= names
     for tool in body["data"]["tools"]:
         assert tool["description"]
         assert tool["parameters"]["type"] == "object"

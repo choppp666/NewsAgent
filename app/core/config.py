@@ -57,6 +57,29 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "gpt-4o-mini"
     NEWS_API_KEY: str | None = None
 
+    # ---------- 新闻采集（第三阶段） ----------
+    # 启用的 RSS 源 ID 列表（逗号分隔），留空表示使用 app/news/feeds.py 里的默认集合
+    NEWS_FEEDS: str = ""
+    # 单次请求单个 RSS 源最多读取多少条（防止 800KB 的大源撑爆上下文）
+    NEWS_MAX_ITEMS_PER_FEED: int = 30
+    # RSS / 文章页 HTTP 超时（秒）
+    NEWS_FETCH_TIMEOUT: float = 12.0
+    # 单次抓取的最大响应体（字节），超出部分丢弃
+    NEWS_HTTP_MAX_BYTES: int = 3_000_000
+    # search_news 默认返回条数上限
+    NEWS_SEARCH_MAX_ITEMS: int = 12
+    # fetch_article 返回正文的最大字符数
+    NEWS_ARTICLE_MAX_CHARS: int = 6000
+    # 两段标题相似度超过该阈值即判定为同一条新闻
+    NEWS_TITLE_SIMILARITY: float = 0.9
+    # 简报在 workspace 内的输出子目录
+    BRIEFING_OUTPUT_DIR: str = "briefings"
+    # 生成简报的专用护栏：搜索 + 读原文 + 写作 + 入库，轮数比通用任务更多，
+    # 但仍受 Agent 主循环的硬上限（20 轮 / 50 次调用）约束。
+    BRIEFING_MAX_STEPS: int = 16
+    BRIEFING_MAX_TOOL_CALLS: int = 40
+    BRIEFING_RUN_TIMEOUT: float = 600.0
+
     # ---------- Agent 行为参数 ----------
     # 模式：auto（有 key 用真实 LLM，否则降级 mock）/ openai / mock
     AGENT_MODE: str = "auto"

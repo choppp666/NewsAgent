@@ -37,6 +37,8 @@ tmp/
 workspace/summary.md
 workspace/todo_report.md
 workspace/*.tmp
+# 简报 Markdown 属运行产物（数据库里已有正文），不纳入版本管理
+workspace/briefings/
 
 # ---------- 测试与覆盖率 ----------
 .pytest_cache/

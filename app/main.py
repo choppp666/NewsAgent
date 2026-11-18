@@ -63,11 +63,12 @@ app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     description=(
-        "每日 AI 新闻助手 —— 第二阶段：Agent 核心与 Function Calling 工具调用。\n\n"
+        "每日 AI 新闻助手 —— 第三阶段：新闻采集、个性化筛选与简报生成。\n\n"
         "第一阶段提供用户与订阅偏好管理（/api/v1/*）；"
-        "第二阶段新增 Agent 调试接口（/api/agent/*），"
-        "支持 list_dir / read_file / search_content / write_file / bash 五个工具的自主调用。"
-        "新闻搜索、定时任务与推送在后续阶段实现。"
+        "第二阶段提供 Agent 调试接口（/api/agent/*），支持文件与命令工具；"
+        "第三阶段在同一个 Agent 上新增 search_news / fetch_article / get_user_preferences / save_briefing，"
+        "由模型自行决定搜索策略并生成简报（POST /api/agent/briefings），简报可按用户查询（/api/v1/briefings）。\n"
+        "定时任务与消息推送在后续阶段实现。"
     ),
     lifespan=lifespan,
     docs_url="/docs",

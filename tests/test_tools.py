@@ -240,8 +240,13 @@ def test_bash_env_does_not_leak_secrets(ctx: ToolContext, monkeypatch: pytest.Mo
 # ---------------------------------------------------------------- 注册中心
 
 
-def test_all_five_tools_registered() -> None:
-    assert set(tool_registry.names()) == {"list_dir", "read_file", "search_content", "write_file", "bash"}
+FILE_TOOLS = {"list_dir", "read_file", "search_content", "write_file", "bash"}
+NEWS_TOOLS = {"get_user_preferences", "search_news", "fetch_article", "save_briefing"}
+
+
+def test_all_tools_registered() -> None:
+    """两阶段的工具必须注册在**同一个**注册表里（第三阶段验收项）。"""
+    assert set(tool_registry.names()) == FILE_TOOLS | NEWS_TOOLS
 
 
 def test_schema_shape_is_function_calling_compatible() -> None:
@@ -253,9 +258,14 @@ def test_schema_shape_is_function_calling_compatible() -> None:
         parameters = function["parameters"]
         assert parameters["type"] == "object"
         assert isinstance(parameters["properties"], dict) and parameters["properties"]
-        # 每个参数都要有类型（LLM 靠它决定怎么填），且不应出现 $ref
+        # 每个参数都要能确定类型（LLM 靠它决定怎么填）；可选参数允许用 anyOf 表达「T 或 null」
         for name, prop in parameters["properties"].items():
-            assert "type" in prop, f"{function['name']}.{name} 缺少 type"
+            if "type" in prop:
+                continue
+            branches = prop.get("anyOf") or []
+            assert branches and all("type" in branch for branch in branches), (
+                f"{function['name']}.{name} 既没有 type 也没有合法的 anyOf"
+            )
         assert "$ref" not in str(parameters)
 
 

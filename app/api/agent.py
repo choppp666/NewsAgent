@@ -5,6 +5,7 @@
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | POST | /api/agent/run | 提交任务，同步返回最终回答 + 完整工具调用轨迹 |
+| POST | /api/agent/briefings | 为你指定用户生成每日新闻简报（第三阶段）|
 | GET | /api/agent/tools | 查看已注册工具及其 JSON Schema（验证「工具能正确注册给 LLM」）|
 | GET | /api/agent/runs | 最近若干次运行摘要 |
 | GET | /api/agent/runs/{run_id} | 单次运行的完整轨迹 |
@@ -13,17 +14,23 @@
 本阶段的目标是「看得见 Agent 怎么一步步走的」，同步返回可以直接把轨迹和答案一起给出来，
 不用引入 SSE / WebSocket。真正的产品形态应该改成流式（边执行边推送事件），
 但那是下一阶段的事——现在优先把循环本身讲清楚。
+
+为什么「生成简报」不复用 /api/agent/run：
+/run 是通用调试入口，任务文本由调用方自己写；生成简报需要服务端先读偏好、
+再拼任务书、再注入简报专用 prompt，否则「个性化」这件事就交给调用方了。
+两个接口共用同一个 AgentRunner，只是任务来源不同。
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import date
 
 from fastapi import APIRouter, Query, status
 
-from app.agent.loop import AgentRunner
+from app.agent.briefing_task import run_briefing
 from app.agent.llm import LLMError, build_llm_client
-from app.agent.registry import tool_registry
+from app.agent.loop import AgentRunner
 from app.agent.schemas import (
     AgentRunListOut,
     AgentRunOut,
@@ -31,9 +38,13 @@ from app.agent.schemas import (
     ToolListOut,
     ToolSpecOut,
 )
+from app.agent.registry import tool_registry
 from app.agent.tracer import run_store
+from app.api.deps import DbSession
 from app.core.exceptions import AppError, NotFoundError
 from app.core.response import ApiResponse, success
+from app.schemas.briefing import BriefingOut, BriefingRunOut, BriefingRunRequest
+from app.services import briefing_service
 
 logger = logging.getLogger(__name__)
 
@@ -129,3 +140,70 @@ def get_run(run_id: str) -> dict:
     if record is None:
         raise NotFoundError(f"运行记录不存在：{run_id}")
     return success(record.to_dict())
+
+
+# ---------------------------------------------------------------- 新闻简报（第三阶段）
+
+
+@router.post(
+    "/briefings",
+    response_model=ApiResponse[BriefingRunOut],
+    summary="生成每日新闻简报（Agent 自主执行）",
+    description=(
+        "读取该用户的订阅偏好 → 交给 Agent 自主决定搜索策略 → 生成 Markdown 简报 → 写入文件并入库。\n\n"
+        "**搜什么词、搜几次、读不读原文、什么时候停止，全部由模型决定**，服务端只提供工具与护栏："
+        "时间过滤、跨调用去重、排除词、正文抓取失败如实返回、简报结构与链接校验。"
+    ),
+    status_code=status.HTTP_200_OK,
+)
+async def generate_briefing(payload: BriefingRunRequest, db: DbSession) -> dict:
+    """为指定用户生成当天的新闻简报。
+
+    Args:
+        payload: 用户 ID、日期、可选的额外关注点与模型模式。
+        db: 请求级会话（只用于读偏好与回读结果；工具内部使用同引擎的新会话）。
+
+    Returns:
+        统一响应信封，data 含 Agent 轨迹与入库结果。
+
+    Raises:
+        AppError: 用户不存在 / 未配置偏好 / 模型配置缺失。
+    """
+    # 1) 读偏好：个性化筛选的输入
+    profile = briefing_service.get_user_profile(db, payload.user_id)
+    if not profile.focus:
+        raise AppError(
+            f"用户 {profile.nickname}（id={profile.user_id}）还没有设置订阅偏好，"
+            "无法生成个性化简报。请先调用 PUT /api/v1/users/{user_id}/subscription 保存关注话题或关键词。",
+            code=400,
+        )
+
+    briefing_date = payload.briefing_date or date.today()
+
+    # 2) 交给编排层：拼任务书 → 注入简报 prompt → 跑同一个 AgentRunner
+    result = await run_briefing(
+        db,
+        profile,
+        briefing_date=briefing_date,
+        focus=payload.focus,
+        llm_mode=payload.llm_mode,
+        max_steps=payload.max_steps,
+    )
+
+    data = BriefingRunOut(
+        run=AgentRunOut.model_validate(result.record.to_dict()),
+        briefing=BriefingOut.from_model(result.briefing) if result.briefing else None,
+        briefing_saved=result.saved,
+        file_path=result.file_path,
+        news_candidates=result.news_candidates,
+        fetched_articles=result.fetched_articles,
+        searches=result.searches,
+        warnings=result.warnings,
+    )
+
+    message = (
+        f"简报已生成（{result.briefing.news_count} 条）"
+        if result.briefing
+        else "本次运行未产出简报，详见 warnings"
+    )
+    return success(data, message=message)

@@ -14,6 +14,8 @@
 
   // ---------------------------------------------------------- 常量
   const API_BASE = '/api/v1';
+  // 简报表现在 /api/agent 下（生成接口会跑完整 Agent 循环，耗时长）
+  const AGENT_API = '/api/agent';
   const STORAGE_KEY = 'news_agent_user_id';
 
   const LIMITS = {
@@ -52,11 +54,21 @@
   const presetRow = $('presetRow');
   const stepEls = Array.from(document.querySelectorAll('.step'));
 
+  const genBtn = $('genBtn');
+  const briefingState = $('briefingState');
+  const briefingSub = $('briefingSub');
+  const briefingProgress = $('briefingProgress');
+  const progressText = $('progressText');
+  const briefingStats = $('briefingStats');
+  const briefingBody = $('briefingBody');
+
   // 运行时状态
   const state = {
     userId: null,
     dirty: false,
     loading: false,
+    briefingLoading: false,
+    briefing: null,
   };
 
   // ==========================================================
@@ -65,10 +77,10 @@
 
   /** 统一的请求封装：统一解析「{code, message, data}」信封并抛出可读错误 */
   async function request(path, options = {}) {
-    const { method = 'GET', body } = options;
+    const { method = 'GET', body, base = API_BASE } = options;
     let response;
     try {
-      response = await fetch(API_BASE + path, {
+      response = await fetch(base + path, {
         method,
         headers: body ? { 'Content-Type': 'application/json' } : undefined,
         body: body ? JSON.stringify(body) : undefined,
@@ -456,6 +468,7 @@
         updateChip();
         updateSteps(1);
         setStatus('本地关联的用户已不存在，请重新保存配置', '');
+        loadBriefing();
       } else {
         toast(error.message, 'error');
       }
@@ -513,6 +526,9 @@
       updateSteps(3);
       setStatus(`已保存 · 最后更新 ${formatTime(preference.updated_at)}`, 'is-saved');
       toast('订阅保存成功', 'success');
+
+      // 偏好变了，今天的简报状态也要跟着刷新（可能已经有旧简报）
+      loadBriefing();
     } catch (error) {
       setStatus('保存失败，请重试', '');
       toast(error.message || '保存失败', 'error');
@@ -542,6 +558,262 @@
     updateSteps(1);
     setStatus('信息尚未保存', '');
     nicknameEl.focus();
+    loadBriefing();
+  }
+
+  // ==========================================================
+  //  今日简报
+  // ==========================================================
+
+  /** 本地时区的 YYYY-MM-DD。不能用 toISOString()，那是 UTC，晚上 8 点后会算成第二天 */
+  function todayISO() {
+    const now = new Date();
+    const pad = (value) => String(value).padStart(2, '0');
+    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  }
+
+  function escapeHtml(text) {
+    return String(text).replace(
+      /[&<>"']/g,
+      (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])
+    );
+  }
+
+  /**
+   * 行内语法：**粗体**、`代码`、[文字](链接)、裸链接。
+   * 必须「先转义再插标签」——简报正文来自大模型，直接塞进 innerHTML 会有 XSS 风险。
+   */
+  function renderInline(text) {
+    const links = [];
+    let out = escapeHtml(text);
+
+    // Markdown 链接先换成占位符，否则后面的裸链接规则会把它二次包裹
+    out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (match, label, url) => {
+      links.push(`<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`);
+      return `\u0001${links.length - 1}\u0001`;
+    });
+
+    out = out.replace(/`([^`]+)`/g, '<code>$1</code>');
+    out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    // 裸链接：前面可能是空格，也可能是中文冒号/顿号/括号（简报里写作「原文链接：https://…」）
+    out = out.replace(
+      /(^|[\s\u3000（(【\[：:，,、；;])(https?:\/\/[^\s<>"'）)】\]，。；、]+)/g,
+      (match, lead, url) => {
+        return `${lead}<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`;
+      }
+    );
+
+    return out.replace(/\u0001(\d+)\u0001/g, (match, index) => links[Number(index)] || '');
+  }
+
+  /**
+   * 轻量 Markdown 渲染：只覆盖简报实际用到的语法
+   * （# ~ ### 标题、有序/无序列表、引用、粗体、行内代码、链接）。
+   * 不引第三方库：页面要求零依赖，内网离线也能打开。
+   */
+  function renderMarkdown(markdown) {
+    const lines = String(markdown || '').replace(/\r\n/g, '\n').split('\n');
+    const html = [];
+    let listTag = null;
+    let quoteLines = [];
+
+    const closeList = () => {
+      if (listTag) {
+        html.push(`</${listTag}>`);
+        listTag = null;
+      }
+    };
+    const flushQuote = () => {
+      if (quoteLines.length) {
+        html.push(`<blockquote><p>${quoteLines.map(renderInline).join('<br />')}</p></blockquote>`);
+        quoteLines = [];
+      }
+    };
+
+    for (const rawLine of lines) {
+      const line = rawLine.trimEnd();
+
+      if (!line.trim()) {
+        closeList();
+        flushQuote();
+        continue;
+      }
+
+      if (line.startsWith('> ')) {
+        closeList();
+        quoteLines.push(line.slice(2));
+        continue;
+      }
+      flushQuote();
+
+      const heading = /^(#{1,3})\s+(.*)$/.exec(line);
+      if (heading) {
+        closeList();
+        const level = heading[1].length;
+        html.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
+        continue;
+      }
+
+      if (/^(-{3,}|\*{3,})$/.test(line.trim())) {
+        closeList();
+        html.push('<hr />');
+        continue;
+      }
+
+      const ordered = /^(\d+)\.\s+(.*)$/.exec(line);
+      const unordered = /^[-*+]\s+(.*)$/.exec(line);
+      if (ordered || unordered) {
+        const tag = ordered ? 'ol' : 'ul';
+        if (listTag !== tag) {
+          closeList();
+          html.push(`<${tag}>`);
+          listTag = tag;
+        }
+        html.push(`<li>${renderInline(ordered ? ordered[2] : unordered[1])}</li>`);
+        continue;
+      }
+
+      closeList();
+      html.push(`<p>${renderInline(line)}</p>`);
+    }
+
+    closeList();
+    flushQuote();
+    return html.join('\n');
+  }
+
+  function updateBriefingButton() {
+    genBtn.disabled = state.briefingLoading || !state.userId;
+    genBtn.querySelector('.btn-label').textContent = state.briefing ? '重新生成' : '生成今日简报';
+  }
+
+  function setBriefingLoading(loading) {
+    state.briefingLoading = loading;
+    genBtn.classList.toggle('is-loading', loading);
+    briefingProgress.hidden = !loading;
+
+    if (loading) {
+      genBtn.disabled = true;
+      genBtn.querySelector('.btn-label').textContent = '生成中…';
+    } else {
+      updateBriefingButton();
+    }
+  }
+
+  function resetBriefingView() {
+    state.briefing = null;
+    briefingBody.hidden = true;
+    briefingBody.innerHTML = '';
+    briefingStats.hidden = true;
+    briefingStats.innerHTML = '';
+  }
+
+  /** 读取今天的简报（同一用户同一天只会有一条） */
+  async function loadBriefing() {
+    if (!state.userId) {
+      resetBriefingView();
+      briefingState.textContent = '尚未生成';
+      briefingSub.textContent = '保存订阅偏好后即可生成';
+      updateBriefingButton();
+      return;
+    }
+
+    briefingState.textContent = '读取中…';
+    briefingSub.textContent = '';
+    try {
+      const data = await request(`/briefings?user_id=${state.userId}&page=1&page_size=30`);
+      const today = todayISO();
+      const found = (data.items || []).find((item) => item.briefing_date === today);
+
+      if (!found) {
+        resetBriefingView();
+        briefingState.textContent = '今日尚未生成';
+        briefingSub.textContent = '点右侧按钮，Agent 会现场检索并撰写';
+      } else {
+        const detail = await request(`/briefings/${found.id}`);
+        renderBriefing(detail);
+      }
+    } catch (error) {
+      briefingState.textContent = '读取失败';
+      briefingSub.textContent = error.message;
+    } finally {
+      updateBriefingButton();
+    }
+  }
+
+  function renderBriefing(briefing) {
+    state.briefing = briefing;
+    briefingState.textContent = `已生成 · ${briefing.briefing_date}`;
+    briefingSub.textContent = `${briefing.news_count} 条 · ${formatTime(briefing.generated_at)} 生成`;
+    briefingBody.innerHTML = renderMarkdown(briefing.content || '');
+    briefingBody.hidden = false;
+    briefingStats.hidden = true;
+    briefingStats.innerHTML = '';
+    updateBriefingButton();
+  }
+
+  /** 把本次运行的轨迹摘要做成小标签，让人看得出「模型真的自己跑了一轮」 */
+  function renderRunStats(result) {
+    const run = result.run || {};
+    const pairs = [
+      ['搜索', `${(result.searches || []).length} 次`],
+      ['候选', `${result.news_candidates || 0} 条`],
+      ['读原文', `${result.fetched_articles || 0} 篇`],
+      ['轮数', String(run.steps || 0)],
+      ['工具调用', `${run.tool_call_count || 0} 次`],
+      ['耗时', `${((run.duration_ms || 0) / 1000).toFixed(1)}s`],
+      ['模型', `${run.llm_mode || ''}/${run.model || ''}`],
+    ];
+    briefingStats.innerHTML = pairs
+      .map(([label, value]) => `<li>${label} <b>${escapeHtml(value)}</b></li>`)
+      .join('');
+    briefingStats.hidden = false;
+  }
+
+  async function generateBriefing() {
+    if (state.briefingLoading) return;
+    if (!state.userId) {
+      toast('请先保存订阅偏好', 'error');
+      return;
+    }
+
+    setBriefingLoading(true);
+    briefingState.textContent = '正在生成…';
+    briefingSub.textContent = '模型正在自主检索';
+
+    const startedAt = Date.now();
+    const tick = () => {
+      const seconds = Math.round((Date.now() - startedAt) / 1000);
+      progressText.textContent = `模型正在自主执行（搜索 → 读原文 → 撰写），已用 ${seconds} 秒`;
+    };
+    tick();
+    const timer = setInterval(tick, 500);
+
+    try {
+      const result = await request('/briefings', {
+        method: 'POST',
+        base: AGENT_API,
+        body: { user_id: state.userId },
+      });
+
+      if (result && result.briefing) {
+        renderBriefing(result.briefing);
+        renderRunStats(result);
+        toast('简报已生成并入库', 'success');
+      } else {
+        const reason = (result && (result.warnings || []).join('；')) || '本次未生成简报';
+        briefingState.textContent = '生成未完成';
+        briefingSub.textContent = reason;
+        toast(reason, 'error');
+      }
+    } catch (error) {
+      briefingState.textContent = '生成失败';
+      briefingSub.textContent = error.message || '请稍后重试';
+      toast(error.message || '生成失败', 'error');
+    } finally {
+      clearInterval(timer);
+      setBriefingLoading(false);
+    }
   }
 
   // ==========================================================
@@ -557,6 +829,7 @@
 
   saveBtn.addEventListener('click', handleSave);
   resetBtn.addEventListener('click', handleReset);
+  genBtn.addEventListener('click', generateBriefing);
 
   // Ctrl / Cmd + S 快捷保存
   document.addEventListener('keydown', (event) => {
@@ -574,18 +847,34 @@
     }
   });
 
+  /**
+   * 初始用户来源：URL 参数优先，其次 localStorage。
+   * 支持 `?user_id=3` 直接打开某个用户的简报，验收和排障时不用手动改本地存储。
+   */
+  function resolveInitialUserId() {
+    const fromUrl = Number(new URLSearchParams(window.location.search).get('user_id'));
+    if (Number.isInteger(fromUrl) && fromUrl > 0) {
+      localStorage.setItem(STORAGE_KEY, String(fromUrl));
+      return fromUrl;
+    }
+
+    const stored = localStorage.getItem(STORAGE_KEY);
+    const fromStore = stored ? Number(stored) : NaN;
+    return Number.isInteger(fromStore) && fromStore > 0 ? fromStore : null;
+  }
+
   function bootstrap() {
     renderPresets();
     updateChip();
     updateSteps(1);
 
-    const stored = localStorage.getItem(STORAGE_KEY);
-    const userId = stored ? Number(stored) : null;
+    const userId = resolveInitialUserId();
 
-    if (userId && Number.isInteger(userId) && userId > 0) {
+    if (userId) {
       state.userId = userId;
       updateChip();
       loadSavedData(userId);
+      loadBriefing();
     } else {
       nicknameEl.focus();
     }

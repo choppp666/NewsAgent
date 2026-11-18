@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.agent.llm.base import LLMResponse, ToolCall
+from app.agent.llm.mock_news import NewsPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +125,8 @@ class MockLLMClient:
         self.model = model
         self.max_read_files = max(1, max_read_files)
         self._seq = 0
+        # 新闻简报场景的策略（状态机 + 模板），见 mock_news.py 的定位说明
+        self._news_policy = NewsPolicy()
 
     # ------------------------------------------------------------ 接口实现
 
@@ -139,6 +142,23 @@ class MockLLMClient:
 
         if not tools or tool_choice == "none":
             return LLMResponse(content="（Mock 模式）未提供可用工具，无法执行任务。", finish_reason="stop", model=self.model)
+
+        available = {
+            str((tool.get("function") or {}).get("name") or "")
+            for tool in tools
+            if isinstance(tool, dict)
+        }
+
+        # 新闻简报任务走独立策略：它需要「搜索 → 补读 → 写作 → 入库」的多步编排，
+        # 与文件任务的意图解析完全不同。真正的模型这两种任务共用一套语义理解，
+        # Mock 做不到，只能按领域分派——这也是它不能代表模型能力的原因之一。
+        if "search_news" in available and ("简报" in task or "新闻" in task):
+            plan = self._news_policy.decide(task, observations, available)
+            if plan.kind == "final":
+                return LLMResponse(content=plan.answer, finish_reason="stop", model=self.model)
+            if plan.tool and plan.tool in available:
+                return self._call(plan.tool, plan.arguments or {})
+            logger.warning("Mock 新闻策略请求了未注册的工具 %r，回退到通用策略", plan.tool)
 
         return self._decide(task, observations)
 
