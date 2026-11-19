@@ -114,16 +114,23 @@ def test_two_users_get_different_briefings(
 def test_agent_trace_shows_autonomous_multi_step(
     client: TestClient, briefing_env: Path, user_a: int
 ) -> None:
-    """轨迹要能看出：读偏好 → 多次搜索 → 读原文 → 写文件 → 入库。"""
+    """轨迹要能看出：读偏好 → 多次搜索 → 读原文 → 一次性交付（入库 + 落盘）。"""
     data = _generate(client, user_a)
     tools = [call["tool"] for call in data["run"]["tool_calls"]]
 
     assert tools[0] == "get_user_preferences"
     assert tools.count("search_news") >= 2  # 至少两个关注方向各搜一次
-    assert "write_file" in tools
     assert "save_briefing" in tools
+    # 交付必须一步到位：同一份正文只生成一次，不要再额外 write_file 重复写
+    assert "write_file" not in tools
+    assert tools.count("save_briefing") == 1
     assert data["run"]["steps"] >= 5
     assert data["run"]["status"] == "completed"
+
+    # save_briefing 自己把文件落了盘
+    exported = briefing_env / data["briefing"]["file_path"]
+    assert exported.is_file()
+    assert exported.read_text(encoding="utf-8").strip()
 
     # 搜索关键词应当来自用户偏好，而不是写死的常量
     searched = [call["arguments"]["keyword"] for call in data["run"]["tool_calls"] if call["tool"] == "search_news"]

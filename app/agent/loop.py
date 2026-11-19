@@ -71,6 +71,15 @@ MAX_TOOL_CALLS_HARD_LIMIT = 50
 REPEAT_WARNING_THRESHOLD = 3
 
 
+def _messages_size(messages: list[dict[str, Any]]) -> int:
+    """估算上下文体积（字符数）。
+
+    只统计 `content`：`tool_calls` 里的参数很短，忽略不计。
+    中文字符大致 1 字符 ≈ 1 token，按字符数估算足够接近，且偏保守。
+    """
+    return sum(len(str(message.get("content") or "")) for message in messages)
+
+
 class AgentRunner:
     """把一个任务跑完：多轮 LLM 决策 + 工具执行。"""
 
@@ -93,6 +102,11 @@ class AgentRunner:
         self.run_timeout = run_timeout if run_timeout is not None else settings.AGENT_RUN_TIMEOUT
         # 工具 Schema 只生成一次：每次请求都一样，没必要重复构造
         self._tools_schema = self.registry.openai_tools()
+        # 上下文预算：超过就压缩较早的工具结果（详见 _enforce_context_budget）
+        self.context_budget = max(0, int(getattr(settings, "AGENT_CONTEXT_BUDGET_CHARS", 0) or 0))
+        self.keep_full_results = max(
+            0, int(getattr(settings, "AGENT_TOOL_RESULT_KEEP_FULL", 3) or 0)
+        )
         # system prompt 允许外部注入：不同业务场景（文件整理 / 新闻简报）
         # 需要不同的行为约束，但循环本身完全一致。
         self._system_prompt = system_prompt or build_system_prompt(
@@ -137,6 +151,9 @@ class AgentRunner:
         repeat_counter: Counter[str] = Counter()
         warned_repeat = False
         last_content = ""
+        # 每条 tool 消息在 messages 里的下标 + 它的「压缩版」正文，
+        # 供上下文超预算时按需替换（不删除消息，避免破坏 tool_call_id 配对）
+        tool_slots: list[dict[str, Any]] = []
 
         logger.info(
             "[run:%s] 开始 | 模式=%s | 模型=%s | 轮数上限=%s | 工具次数上限=%s",
@@ -179,7 +196,16 @@ class AgentRunner:
                             break
 
                         result = await self._execute(call)
+                        slot_index = len(messages)
                         messages.append(self._tool_message(call, result))
+                        tool_slots.append(
+                            {
+                                "index": slot_index,
+                                "tool": call.name,
+                                "compact": self._compact_tool_content(result),
+                                "stub": self._stub_tool_content(result),
+                            }
+                        )
                         record.tool_calls.append(self._to_record(call, result, len(record.tool_calls) + 1))
 
                         logger.info(
@@ -206,6 +232,10 @@ class AgentRunner:
                                 }
                             )
                             logger.warning("[run:%s] 检测到重复工具调用，已提醒模型换策略", run_id)
+
+                    # 本轮工具结果回填完，检查一次总预算：
+                    # 超了就把最早的结果压成精简版，保证后续轮次还塞得进去
+                    self._enforce_context_budget(messages, tool_slots, run_id)
 
                     if hit_call_limit:
                         record.status = "max_tool_calls_reached"
@@ -237,12 +267,14 @@ class AgentRunner:
             record.finished_at = datetime.now()
             record.duration_ms = int((time.perf_counter() - started) * 1000)
             logger.info(
-                "[run:%s] 结束 | 状态=%s | 轮数=%s | 工具调用=%s | 耗时=%sms",
+                "[run:%s] 结束 | 状态=%s | 轮数=%s | 工具调用=%s | 上下文=%s字符 | 耗时=%sms | tokens=%s",
                 run_id,
                 record.status,
                 record.steps,
                 len(record.tool_calls),
+                _messages_size(messages),
                 record.duration_ms,
+                self._format_usage(record),
             )
 
         return record
@@ -289,6 +321,199 @@ class AgentRunner:
             "content": result.to_llm_payload(settings.AGENT_TOOL_RESULT_LIMIT),
         }
 
+    # ------------------------------------------------------------ 上下文预算
+
+    def _enforce_context_budget(
+        self,
+        messages: list[dict[str, Any]],
+        slots: list[dict[str, Any]],
+        run_id: str,
+    ) -> None:
+        """工具结果累计超过预算时，把较早的结果换成精简版。
+
+        为什么不直接删旧消息：`assistant.tool_calls` 与 `role=tool` 必须成对出现，
+        删掉任意一条都可能让服务商直接报 400；只替换 `content` 则完全安全。
+
+        两轮压缩：
+        1. 先压「最近 keep_full 条之外」的旧结果——模型已经不再依赖它们；
+        2. 还超预算就继续压最新的几条（只保留 1 条全文）。
+           这一轮是有代价的（模型可能刚读到的正文被截短），所以只在
+           「不压就会撞上下文窗口」时才做，并单独告警。
+
+        Args:
+            messages: 完整上下文（就地修改 tool 消息的 content）。
+            slots: 每条 tool 消息的下标与它的压缩版正文。
+            run_id: 日志用。
+        """
+        budget = self.context_budget
+        if budget <= 0 or not slots:
+            return
+
+        size = _messages_size(messages)
+        if size <= budget:
+            return
+
+        saved = 0
+        shrunk = 0
+        shrunk_late = 0
+        stubbed = 0
+
+        def compress(slot: dict[str, Any], key: str = "compact") -> int:
+            """把一条 tool 消息换成指定压缩档的正文，返回节省的字符数。"""
+            try:
+                message = messages[slot["index"]]
+            except IndexError:  # pragma: no cover - 防御：下标永远有效
+                return 0
+            current = str(message.get("content") or "")
+            target = str(slot.get(key) or "")
+            if not target or len(target) >= len(current):
+                return 0
+            message["content"] = target
+            return len(current) - len(target)
+
+        # 第一轮：旧结果 → 精简版
+        head_end = max(0, len(slots) - self.keep_full_results)
+        for slot in slots[:head_end]:
+            if size - saved <= budget:
+                break
+            delta = compress(slot)
+            if delta:
+                saved += delta
+                shrunk += 1
+
+        # 第二轮：兜底压最近几条（从旧到新，必要时连最后一条也压）
+        if size - saved > budget:
+            for slot in slots[head_end:]:
+                if size - saved <= budget:
+                    break
+                delta = compress(slot)
+                if delta:
+                    saved += delta
+                    shrunk += 1
+                    shrunk_late += 1
+
+        # 第三轮：还放不下，就把最旧的结果压成「只有调用记录」的存根。
+        # 走到这一步通常意味着工具调用次数太多（例如一次运行搜了 40 次），
+        # 此时「记得搜过什么」比「回放完整结果」更值得占用上下文。
+        if size - saved > budget:
+            for slot in slots:
+                if size - saved <= budget:
+                    break
+                delta = compress(slot, "stub")
+                if delta:
+                    saved += delta
+                    shrunk += 1
+                    stubbed += 1
+
+        if shrunk:
+            logger.info(
+                "[run:%s] 上下文超预算（%s > %s 字符）：压缩 %s 条工具结果（其中 %s 条压成存根），"
+                "节省约 %s 字符",
+                run_id,
+                size,
+                budget,
+                shrunk,
+                stubbed,
+                saved,
+            )
+        if shrunk_late:
+            logger.warning(
+                "[run:%s] 旧结果压完仍超预算，额外截短了最近 %s 条结果",
+                run_id,
+                shrunk_late,
+            )
+        if stubbed:
+            logger.warning(
+                "[run:%s] 仍有 %s 条工具结果被压成存根（只保留调用记录）——"
+                "本次工具调用偏多，可考虑收敛搜索关键词或调大 AGENT_CONTEXT_BUDGET_CHARS",
+                run_id,
+                stubbed,
+            )
+        if size - saved > budget:
+            logger.warning(
+                "[run:%s] 压缩后仍超预算（%s > %s 字符）：单条结果上限 %s 已是最后一道闸，"
+                "检查该任务是否搜索过于频繁",
+                run_id,
+                size - saved,
+                budget,
+                settings.AGENT_TOOL_RESULT_LIMIT,
+            )
+
+    @staticmethod
+    def _compact_tool_content(result: ToolResult) -> str:
+        """生成工具结果的精简版正文。
+
+        保留三样东西：一句话结论（summary）、可溯源的关键字段（标题/链接/来源/时间）、
+        以及「被压缩过」的显式标注——避免模型误以为当初拿到的就只有这么多。
+        """
+        data = result.data if isinstance(result.data, dict) else {}
+        payload: dict[str, Any] = {
+            "ok": result.ok,
+            "tool": result.tool,
+            "summary": result.summary,
+            "compacted": True,
+        }
+        if result.error is not None:
+            payload["error"] = result.error.to_dict()
+
+        items = data.get("items")
+        if isinstance(items, list) and items:
+            # 只留「可溯源的最小集合」：news_id 用于后续引用，标题/来源/时间/链接用于写简报。
+            # 刻意丢掉 stats / source_reports / duplicates / excluded —— 那些是排查用的，
+            # 模型不需要，一次搜索能占几百字符，28 次搜索就是几万字符。
+            payload["items"] = [
+                {
+                    "news_id": item.get("news_id"),
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                    "source": item.get("source"),
+                    "published": item.get("published"),
+                }
+                for item in items
+                if isinstance(item, dict)
+            ]
+            payload["note"] = "早期搜索结果已压缩：只保留标题与链接（条目仍在候选池），需要摘要请重新搜索。"
+        elif isinstance(data.get("content"), str):
+            payload["title"] = data.get("title")
+            payload["url"] = data.get("url")
+            payload["source"] = data.get("source")
+            payload["published"] = data.get("published")
+            payload["content_kind"] = data.get("content_kind")
+            payload["content"] = data["content"][:400]
+            payload["note"] = (
+                f"早期正文已截断为前 400 字符（原文 {len(data['content'])} 字符）；"
+                "需要完整内容请再次调用 fetch_article。"
+            )
+        else:
+            raw = json.dumps(data, ensure_ascii=False, default=str) if data else ""
+            payload["data"] = raw[:400]
+            payload["note"] = "早期工具结果已压缩，仅保留摘要与数据前缀。"
+
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _stub_tool_content(result: ToolResult) -> str:
+        """极限压缩：只留「调用过什么、拿到几条」，正文全部丢弃。
+
+        信息并没有真正丢掉——搜索结果都在本轮候选池里，正文也都已经读过；
+        模型失去的只是「完整回放」，但仍然知道自己搜过哪些词、各拿到几条，
+        可以在需要时重新调用工具把细节取回来。
+        """
+        summary = (result.summary or "").strip()
+        if len(summary) > 80:
+            summary = summary[:80] + "…"
+        return json.dumps(
+            {
+                "tool": result.tool,
+                "ok": result.ok,
+                "summary": summary,
+                "compacted": "stub",
+                "note": "该次结果已并入候选池，这里只保留调用记录；需要细节请重新调用工具。",
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
     @staticmethod
     def _to_record(call: ToolCall, result: ToolResult, index: int) -> ToolCallRecord:
         """把一次执行转成可读日志。"""
@@ -321,6 +546,26 @@ class AgentRunner:
         key = f"{call.name}::{call.arguments}"
         counter[key] += 1
         return counter[key] == REPEAT_WARNING_THRESHOLD
+
+    @staticmethod
+    def _format_usage(record: RunRecord) -> str:
+        """把累计 token 用量压成一行，便于算一次运行的真实成本。
+
+        为什么值得单独打印：多轮 Agent 的账单按「每轮重发全部历史」增长，
+        轮数一多总输入 token 是平方级上升。不打印出来，只能靠事后猜。
+        """
+        usage = record.usage or {}
+        prompt = usage.get("prompt_tokens") or usage.get("input_tokens")
+        completion = usage.get("completion_tokens") or usage.get("output_tokens")
+        total = usage.get("total_tokens")
+        parts: list[str] = []
+        if prompt is not None:
+            parts.append(f"in={prompt}")
+        if completion is not None:
+            parts.append(f"out={completion}")
+        if total is not None:
+            parts.append(f"total={total}")
+        return " ".join(parts) or "未上报"
 
     @staticmethod
     def _merge_usage(record: RunRecord, usage: dict[str, int] | None) -> None:

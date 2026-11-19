@@ -37,6 +37,10 @@ class NewsRunState:
     index: dict[str, str] = field(default_factory=dict)
     # canonical_url -> 抓取结果摘要
     fetches: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # canonical_url -> 完整抓取结果（含正文）：同一次运行里重复读同一篇时直接复用，
+    # 不再发第二次网络请求。模型经常为了「再看一眼」把同一篇读两遍，
+    # 每次都是 1~3 秒的纯浪费。
+    fetch_payloads: dict[str, dict[str, Any]] = field(default_factory=dict)
     # 每次 search_news 的调用记录，用于最终汇报「搜了什么、拿到多少」
     searches: list[dict[str, Any]] = field(default_factory=list)
     _seq: int = 0
@@ -76,6 +80,16 @@ class NewsRunState:
         key = canonical_url(url)
         if key:
             self.fetches[key] = summary
+
+    def cached_fetch(self, url: str) -> dict[str, Any] | None:
+        """本轮已抓取过的正文（命中则无需再发网络请求）。"""
+        key = canonical_url(url)
+        return self.fetch_payloads.get(key) if key else None
+
+    def remember_payload(self, url: str, payload: dict[str, Any]) -> None:
+        key = canonical_url(url)
+        if key:
+            self.fetch_payloads[key] = payload
 
     @property
     def fetched_urls(self) -> list[str]:

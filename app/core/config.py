@@ -28,7 +28,12 @@ class Settings(BaseSettings):
     """全局配置对象，字段名与环境变量名一一对应。"""
 
     model_config = SettingsConfigDict(
-        env_file=BASE_DIR / ".env",
+        # 两个文件，后者覆盖前者：
+        # `.env` 放团队共享的默认值（可以提交、可以被编辑器随便改），
+        # `.env.local` 放个人密钥（已在 .gitignore 里）。
+        # 这样做是因为踩过坑：密钥直接写在 .env 里时，编辑器里的旧缓冲一旦保存，
+        # 就会把刚填的 key 静默冲掉，而应用只会「降级成离线策略」，很难第一时间发现。
+        env_file=(BASE_DIR / ".env", BASE_DIR / ".env.local"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",  # 忽略 .env 中未声明的变量，方便后续阶段扩展
@@ -65,12 +70,24 @@ class Settings(BaseSettings):
     NEWS_FEEDS: str = ""
     # 单次请求单个 RSS 源最多读取多少条（防止 800KB 的大源撑爆上下文）
     NEWS_MAX_ITEMS_PER_FEED: int = 30
+    # RSS 源抓取的进程内缓存时长（秒）。一次简报生成会调用多次 search_news，
+    # 每次都重新下载 10 个源纯属浪费：既慢（单次 1~3 秒），又容易被源站限流。
+    # 0 表示关闭缓存，每次都真实抓取。
+    NEWS_FEED_CACHE_TTL: int = 300
     # RSS / 文章页 HTTP 超时（秒）
     NEWS_FETCH_TIMEOUT: float = 12.0
+    # 一轮「抓取全部源」的总时间预算（秒）。httpx 的 timeout 是「每个阶段」的上限，
+    # 不是单次请求总时长——chunk 慢慢吐就能远远超过它（实测有源跑到 13s），
+    # 而一批搜索只要被一个慢源拖住就白等。超过预算还没回来的源按失败处理。
+    NEWS_SEARCH_DEADLINE: float = 8.0
     # 单次抓取的最大响应体（字节），超出部分丢弃
     NEWS_HTTP_MAX_BYTES: int = 3_000_000
     # search_news 默认返回条数上限
     NEWS_SEARCH_MAX_ITEMS: int = 12
+    # 「浏览模式」（不传 keyword）单次最多返回多少条候选。
+    # 浏览模式给的是「今天有什么」的全景，模型据此挑几条读原文，
+    # 所以要比按关键词搜索的 12 条宽得多；但也不能无限大，否则一次塞爆上下文。
+    NEWS_BROWSE_MAX_ITEMS: int = 40
     # fetch_article 返回正文的最大字符数
     NEWS_ARTICLE_MAX_CHARS: int = 6000
     # 两段标题相似度超过该阈值即判定为同一条新闻
@@ -115,6 +132,14 @@ class Settings(BaseSettings):
     AGENT_WRITE_MAX_BYTES: int = 200_000
     # 反馈给 LLM 的单条工具结果最大长度（字符）
     AGENT_TOOL_RESULT_LIMIT: int = 12_000
+    # 单次运行回填给模型的「工具结果总字符预算」。
+    # 只靠单条上限（12k）不够：8 轮 × 每轮多次调用，累积起来能到十几万字符，
+    # 既逼近上下文窗口上限，也按 token 直接烧钱。超过预算时，最旧的工具结果
+    # 会被压缩成「标题 + 链接 + 摘要」的精简形式（保留最近几条全文）。
+    # 设为 0 表示不做预算控制（回退到旧行为）。
+    AGENT_CONTEXT_BUDGET_CHARS: int = 40_000
+    # 压缩时始终保留全文的「最近 N 条工具结果」
+    AGENT_TOOL_RESULT_KEEP_FULL: int = 3
     # 内存中保留的运行记录条数
     AGENT_KEEP_RUNS: int = 50
 
@@ -234,7 +259,29 @@ class Settings(BaseSettings):
         需要「主机 + 发件人地址」两样：只有主机没有发件人时，
         服务器在 MAIL FROM 阶段就会拒信，提前判定可以少发一次无效请求。
         """
-        return bool((self.SMTP_HOST or "").strip()) and bool(self.smtp_sender_address)
+        return not self.smtp_missing_items
+
+    @property
+    def smtp_missing_items(self) -> list[str]:
+        """列出缺失的 SMTP 配置项（给人看的精确提示）。
+
+        为什么需要它：`smtp_configured` 只有 True/False，运维看到 False 完全不知道
+        该改哪个字段。本项目就踩过：`SMTP_HOST=smtp.qq.com` 明明填了，提示却写
+        「未配置 SMTP_HOST」，真正缺的是 `SMTP_USER`（QQ 邮箱账号）与授权码，
+        照着错误文案排查只会原地打转。
+
+        「有账号却没密码」也算未配置：QQ/163 这类服务商一定在 AUTH 阶段拒信，
+        与其发一次必然失败的请求，不如提前拦下并说清原因。
+        反过来「既没账号也没密码」是合法的——内网无认证中继、本地假 SMTP 都这样。
+        """
+        missing: list[str] = []
+        if not (self.SMTP_HOST or "").strip():
+            missing.append("SMTP_HOST")
+        if not self.smtp_sender_address:
+            missing.append("SMTP_USER（或 SMTP_SENDER）")
+        if (self.SMTP_USER or "").strip() and not (self.SMTP_PASSWORD or "").strip():
+            missing.append("SMTP_PASSWORD（QQ/163 填授权码，不是登录密码）")
+        return missing
 
     @property
     def smtp_sender_address(self) -> str:
@@ -252,6 +299,22 @@ class Settings(BaseSettings):
     def smtp_needs_starttls(self) -> bool:
         """非 SSL 直连且端口是 587 时走 STARTTLS。"""
         return not self.smtp_effective_ssl and int(self.SMTP_PORT) == 587
+
+    @property
+    def llm_key_fingerprint(self) -> str:
+        """LLM 密钥指纹，用于日志与排障，绝不泄露完整密钥。
+
+        为什么需要它：密钥文件被编辑器覆盖、被误清空时，应用只会「静默降级成离线策略」，
+        等到发现简报全是模板内容时已经浪费了时间。把 `sk-46b***#a1b2c3d4`
+        打在启动日志里，密钥一变就能立刻看出来。
+        """
+        key = (self.LLM_API_KEY or "").strip()
+        if not key:
+            return "（未配置）"
+        import hashlib
+
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+        return f"{key[:6]}***#{digest}"
 
     # ---------------- 校验与规整 ----------------
 

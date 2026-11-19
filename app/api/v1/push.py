@@ -18,7 +18,6 @@ import logging
 from fastapi import APIRouter, Path, Query
 
 from app.api.deps import CurrentUser, DbSession
-from app.core.config import settings
 from app.core.response import ApiResponse, success
 from app.schemas.push import PushListData, PushRecordOut, PushSettingsIn, PushSettingsOut
 from app.services import push_service, user_service
@@ -39,15 +38,7 @@ router = APIRouter(tags=["邮件推送（第四阶段）"])
 )
 def get_push_settings(user: CurrentUser) -> dict:
     """读取推送配置视图。"""
-    data = PushSettingsOut(
-        user_id=user.id,
-        push_enabled=bool(user.push_enabled),
-        email=user.email,
-        global_enabled=bool(settings.PUSH_ENABLED),
-        smtp_configured=settings.smtp_configured,
-        sender=settings.smtp_sender_address or None,
-    )
-    return success(data)
+    return success(PushSettingsOut.from_user(user))
 
 
 @router.put(
@@ -65,14 +56,7 @@ def update_push_settings(payload: PushSettingsIn, user: CurrentUser, db: DbSessi
         db: 数据库会话。
     """
     updated = user_service.update_push_settings(db, user.id, payload.push_enabled)
-    data = PushSettingsOut(
-        user_id=updated.id,
-        push_enabled=bool(updated.push_enabled),
-        email=updated.email,
-        global_enabled=bool(settings.PUSH_ENABLED),
-        smtp_configured=settings.smtp_configured,
-        sender=settings.smtp_sender_address or None,
-    )
+    data = PushSettingsOut.from_user(updated)
     message = "已开启邮件推送" if updated.push_enabled else "已关闭邮件推送，简报仍会正常生成"
     return success(data, message=message)
 

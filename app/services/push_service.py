@@ -38,6 +38,7 @@ __all__ = [
     "PushResult",
     "push_briefing",
     "push_for_task",
+    "requeue_config_skipped",
     "retry_due_pushes",
     "retry_push_record",
 ]
@@ -192,6 +193,45 @@ def retry_due_pushes(*, limit: int = 50) -> dict[str, int]:
     return stats
 
 
+def requeue_config_skipped(*, days: int = 3, limit: int = 50) -> int:
+    """把「因服务端配置缺失而跳过」的历史推送翻回待重试。
+
+    为什么需要它（一个真实会踩的体验坑）：用户忘了填 SMTP 授权码，当天简报生成成功
+    但推送记为 `skipped`；第二天补上授权码、重启服务，前一天的简报**永远不会自己发出去**
+    ——`skipped` 是终态，`retry_due_pushes` 只扫 `failed`，不做这一步只能一条条手动点重试。
+
+    只在配置已经补齐时执行：否则翻出来也还是跳过，白白刷一遍记录。
+    翻回 `failed` 而不是 `pending`，是为了复用 `retry_due_pushes` 现成的扫描条件
+    （`failed` + `attempts` 未超上限 + 已到期）。
+
+    Args:
+        days: 往回追溯多少天（默认 3 天，避免把很久以前的旧简报突然群发）。
+        limit: 单次最多翻回多少条。
+
+    Returns:
+        被翻回的记录数。
+    """
+    if settings.smtp_missing_items:
+        return 0
+
+    from app.core.database import SessionLocal
+
+    since = local_now() - timedelta(days=max(1, days))
+    with SessionLocal() as db:
+        records = push_crud.list_config_skipped(db, since=since, limit=limit)
+        for record in records:
+            record.status = PushStatus.FAILED.value
+            record.next_retry_at = None  # 立刻到期，本轮重试就会把它发出去
+        if records:
+            db.commit()
+            logger.warning(
+                "推送配置已补齐：%s 条「因配置跳过」的记录重新排入重试（追溯 %s 天内）",
+                len(records),
+                days,
+            )
+        return len(records)
+
+
 # ---------------------------------------------------------------- 内部实现
 
 
@@ -203,10 +243,11 @@ def _blocked_reason(user: User) -> tuple[str, str] | None:
         return PushStatus.DISABLED.value, "用户已关闭邮件推送"
     if not (user.email or "").strip():
         return PushStatus.SKIPPED.value, "用户未填写接收邮箱"
-    if not settings.smtp_configured:
+    missing = settings.smtp_missing_items
+    if missing:
         return (
             PushStatus.SKIPPED.value,
-            "服务端未配置 SMTP_HOST，邮件推送尚未启用（不影响简报生成与页面查看）",
+            "服务端邮件配置不完整（缺少 " + "、".join(missing) + "），简报已生成但未发送",
         )
     return None
 

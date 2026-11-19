@@ -389,3 +389,53 @@ def test_resolve_feeds_falls_back_to_catalog() -> None:
 
     assert [feed.id for feed in feeds] == ["qbitai"]
     assert len(resolve_feeds(None)) == len(FEED_CATALOG)
+
+
+# ---------------------------------------------------------------- 批量抓取预算
+
+
+def test_search_skips_source_that_exceeds_batch_deadline(monkeypatch) -> None:
+    """慢源不许拖住整批：超过总预算就按失败计入报告，而不是一直等到它回来。
+
+    背景：`httpx.Timeout` 限制的是「每个阶段」，响应体慢慢吐就能绕过它
+    （实测有源跑到 13 秒），一批 10 个源里混进一个，整次搜索就白等十几秒。
+    """
+    import time
+
+    from app.core.config import settings
+    from app.news.providers import RSSNewsProvider, SourceReport
+    from app.news.rss import FeedItem
+
+    monkeypatch.setattr(settings, "NEWS_SEARCH_DEADLINE", 0.5)
+    monkeypatch.setattr(settings, "NEWS_FEED_CACHE_TTL", 0)
+
+    provider = RSSNewsProvider()
+
+    def fake_fetch(feed):
+        if feed.id == "ithome":
+            time.sleep(1.5)  # 远超 0.5s 预算
+        item = FeedItem(
+            title=f"{feed.name} 的一条新闻",
+            link=f"https://example.com/{feed.id}/1",
+            summary="摘要",
+            published_at=None,
+            published_raw="",
+            source_id=feed.id,
+            source_name=feed.name,
+        )
+        return feed, SourceReport(feed.id, feed.name, ok=True, item_count=1), [item]
+
+    monkeypatch.setattr(provider, "_fetch_one", fake_fetch)
+
+    started = time.perf_counter()
+    result = provider.search(["qbitai", "ithome"])
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 1.4, f"应按预算返回，实际等了 {elapsed:.2f}s"
+    # 报告顺序与请求的源顺序一致，便于日志与前端稳定展示
+    assert [report.source_id for report in result.sources] == ["qbitai", "ithome"]
+    fast, slow = result.sources
+    assert fast.ok
+    assert not slow.ok and "总预算" in (slow.error or "")
+    # 快源的结果照常返回，不因为另一个源超时整体失败
+    assert len(result.items) == 1

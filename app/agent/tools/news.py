@@ -12,7 +12,7 @@
 | get_user_preferences | 用户到底关心什么 | 不替模型决定搜什么词 |
 | search_news | 今天有哪些候选新闻 | 不判断「重要不重要」 |
 | fetch_article | 这条新闻到底讲了什么 | 抓不到就认输，绝不编 |
-| save_briefing | 把写好的简报入库并校验 | 不改写模型写的内容 |
+| save_briefing | 一次交付：校验 + 入库 + 导出 Markdown | 不改写模型写的内容 |
 
 三条硬约束（都在代码里兜住，不靠模型自觉）：
 1. 简报里的链接必须来自本轮真实检索/抓取（`save_briefing` 校验白名单）；
@@ -32,11 +32,13 @@ from pydantic import BaseModel, Field
 from app.agent.context import ToolContext
 from app.agent.registry import tool_registry
 from app.agent.result import ERR_INVALID_ARGUMENTS, ERR_TOOL_ERROR, ToolResult
+from app.agent.safety import SafetyViolation
 from app.core.config import settings
 from app.core.exceptions import AppError
 from app.news.article import extract_article
 from app.news.briefing import parse_briefing
 from app.news.feeds import list_feed_ids
+from app.news.dedupe import canonical_url
 from app.news.filter import DateRangeError, build_query, find_excluded, match_item, parse_date_range
 from app.news import http as news_http
 from app.news.providers import get_provider
@@ -72,18 +74,22 @@ class SearchNewsArgs(BaseModel):
     """search_news 的参数。"""
 
     keyword: str = Field(
-        min_length=1,
+        default="",
         max_length=80,
         description=(
             "搜索关键词，可以是一个概念、产品名或短语，例如 'AI Agent'、'MCP 协议'、'大模型 编程'。"
             "支持中英文；多个词用空格分隔时，命中过半即算相关。"
+            "**留空表示「浏览模式」**：不按关键词筛选，直接按发布时间倒序列出时间窗内的全部候选"
+            "（只给标题/来源/时间/链接），用于先看清今天有什么、再决定读哪几条。"
         ),
     )
     date_range: str = Field(
-        default="today",
+        default="last_24h",
         description=(
-            "时间范围：today（今天，默认）/ yesterday / last_24h / 3d / 7d / "
-            "2026-11-18（某一天）/ 2026-11-17:2026-11-18（区间）"
+            "时间范围：last_24h（过去 24 小时，默认）/ today（今天 0 点之后）/ yesterday / 3d / 7d / "
+            "2026-11-18（某一天）/ 2026-11-17:2026-11-18（区间）。"
+            "默认用 last_24h 是因为资讯站按「滚动 24 小时」更新，"
+            "而简报多在早上生成——那时「今天 0 点之后」几乎没有内容。"
         ),
     )
     exclude_keywords: list[str] = Field(
@@ -101,11 +107,14 @@ class SearchNewsArgs(BaseModel):
             "一般不需要填写，仅在服务端另外注册了搜索服务（如 websearch / newsapi）时才用得上。"
         ),
     )
-    max_items: int = Field(
-        default=12,
+    max_items: int | None = Field(
+        default=None,
         ge=1,
-        le=30,
-        description="最多返回多少条候选新闻（已按相关度与时间排序）",
+        le=60,
+        description=(
+            "最多返回多少条候选新闻。留空时：关键词模式返回 12 条，"
+            f"浏览模式返回 {settings.NEWS_BROWSE_MAX_ITEMS} 条（浏览要的是全景，条数更宽）"
+        ),
     )
     only_new: bool = Field(
         default=True,
@@ -141,7 +150,12 @@ class SaveBriefingArgs(BaseModel):
     )
     news_count: int | None = Field(default=None, ge=0, le=100, description="简报收录的新闻条数，留空则自动统计")
     file_path: str | None = Field(
-        default=None, max_length=255, description="已导出的 Markdown 文件在工作区内的相对路径（可选）"
+        default=None,
+        max_length=255,
+        description=(
+            "Markdown 要导出到工作区内的相对路径，留空则自动用 briefings/<日期>-user<用户ID>.md。"
+            "本工具会自己落盘，调用方不需要再调 write_file 写一遍同样的内容。"
+        ),
     )
 
 
@@ -189,28 +203,40 @@ def get_user_preferences(args: GetPreferencesArgs, ctx: ToolContext) -> ToolResu
 
 @tool_registry.tool(
     description=(
-        "按关键词和时间范围搜索 AI 新闻（聚合多个 RSS 源）。返回标题、来源、发布时间、摘要与原始链接，"
-        "并自动过滤时间范围外、命中排除词以及重复的条目。一次搜索只覆盖一个关键词，"
-        "多个主题应分多次搜索；找不到相关内容时如实返回 0 条。"
+        "检索 AI 新闻候选（聚合多个 RSS 源），自动过滤时间范围外、命中排除词与重复条目，"
+        "返回标题、来源、发布时间、摘要与原始链接。两种用法："
+        "① 不传 keyword（推荐先做一次）＝浏览模式：按发布时间倒序列出时间窗内全部候选，"
+        "用来一次看清「今天有什么」，再挑几条读正文；"
+        "② 传 keyword＝关键词模式：只返回相关条目，一次一个关键词，用于在清单里定向补充。"
+        "返回里的 `pool_window` 是时间窗内全站候选总数（不受关键词影响）："
+        "若它已接近本轮累计返回条数，说明换同义词也搜不出新东西，应基于现有候选收尾。"
     )
 )
 def search_news(args: SearchNewsArgs, ctx: ToolContext) -> ToolResult:
-    """检索新闻候选。
+    """检索新闻候选（关键词模式 / 浏览模式）。
+
+    两种模式共用同一套「抓取 → 时间过滤 → 排除词 → 去重 → 登记候选池」流程，
+    区别只有一个：是否按关键词做相关度筛选。
 
     Args:
-        args: 关键词、时间范围、排除词、源限定、条数上限等。
+        args: 关键词（留空 = 浏览模式）、时间范围、排除词、源限定、条数上限等。
         ctx: 执行上下文（其 news_state 承载跨调用去重）。
 
     Returns:
-        ToolResult，data.items 为按相关度排序的候选新闻（含 news_id）。
+        ToolResult，data.items 为候选新闻（含 news_id）。
     """
     try:
         window = parse_date_range(args.date_range)
     except DateRangeError as exc:
         return ToolResult.failure(tool="search_news", code=ERR_INVALID_ARGUMENTS, message=str(exc))
 
-    query = build_query(args.keyword)
-    if not query.tokens:
+    # 浏览模式：不带关键词 → 不做相关度筛选，直接按时间倒序列出时间窗内全部候选。
+    # 这是为了替代「反复换关键词试」：一次调用就把今天有什么摆在模型面前，
+    # 让它挑几条读原文，而不是搜十几次才凑齐素材。
+    raw_keyword = (args.keyword or "").strip()
+    browse = not raw_keyword
+    query = None if browse else build_query(raw_keyword)
+    if query is not None and not query.tokens:
         return ToolResult.failure(tool="search_news", code=ERR_INVALID_ARGUMENTS, message="关键词不能为空")
 
     # provider 由配置/参数决定：默认 rss，注册了新搜索服务后改这一处即可切换，
@@ -238,6 +264,9 @@ def search_news(args: SearchNewsArgs, ctx: ToolContext) -> ToolResult:
     duplicates: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
+    # 时间窗内「全站候选」的去重集合（不受关键词/排除词影响）：
+    # 这是给模型判断「还要不要再换词搜」的依据
+    window_urls: set[str] = set()
     out_of_range = 0
     undated = 0
     unmatched = 0
@@ -252,10 +281,29 @@ def search_news(args: SearchNewsArgs, ctx: ToolContext) -> ToolResult:
             out_of_range += 1
             continue
 
+        window_urls.add(canonical_url(item.link))
+
         combined = f"{item.title} {item.summary} {' '.join(item.categories)}"
         hit_exclude = find_excluded(combined, args.exclude_keywords)
         if hit_exclude:
             excluded.append({"title": item.title, "url": item.link, "reason": f"命中排除词「{hit_exclude}」"})
+            continue
+
+        if browse:
+            # 浏览模式的角色是「目录」，不是「正文」：只给一眼能判断的字段。
+            # 这里刻意不带摘要——60 条 × 120 字的摘要在上下文里会被反复重发，
+            # 实测把一次生成的耗时从 60 秒推高到 74 秒；标题本身通常已够筛，
+            # 需要细节时再 fetch_article 或按关键词补搜。
+            candidates.append(
+                {
+                    "title": item.title,
+                    "url": item.link,
+                    "source": item.source_name,
+                    "source_id": item.source_id,
+                    "published": _fmt_time(item.published_at),
+                    "published_unknown": item.published_at is None,
+                }
+            )
             continue
 
         match = match_item(query, title=item.title, summary=item.summary, categories=item.categories)
@@ -278,12 +326,23 @@ def search_news(args: SearchNewsArgs, ctx: ToolContext) -> ToolResult:
             }
         )
 
-    # 先按「相关度 → 时间」排序，再做去重：这样重复条目里留下的是信息更全/更相关的那条
-    candidates.sort(key=lambda entry: (entry["match_score"], entry["published"] or ""), reverse=True)
+    # 排序：关键词模式按「相关度 → 时间」，浏览模式纯按时间倒序（最新在前）
+    if browse:
+        candidates.sort(key=lambda entry: entry["published"] or "", reverse=True)
+    else:
+        candidates.sort(key=lambda entry: (entry["match_score"], entry["published"] or ""), reverse=True)
+
+    # 浏览模式一次给「全景」，但必须有硬上限：清单里的每一条都会被后续每一轮重新发送，
+    # 60 条标题看着不多，累计到十几轮就是十几万字符。模型要求更多时也不放大（分源浏览更划算）；
+    # 关键词模式维持 12 条，避免一次塞太多不相干的条目。
+    if browse:
+        limit = min(args.max_items or settings.NEWS_BROWSE_MAX_ITEMS, settings.NEWS_BROWSE_MAX_ITEMS)
+    else:
+        limit = args.max_items or settings.NEWS_SEARCH_MAX_ITEMS
 
     selected: list[dict[str, Any]] = []
     for entry in candidates:
-        if len(selected) >= args.max_items:
+        if len(selected) >= limit:
             break
 
         if args.only_new:
@@ -309,10 +368,15 @@ def search_news(args: SearchNewsArgs, ctx: ToolContext) -> ToolResult:
     truncated = len(candidates) > len(selected)
 
     stats = {
+        "mode": "browse" if browse else "keyword",
         "feeds_ok": len(result.ok_sources),
         "feeds_failed": len(result.failed_sources),
         "scanned": len(result.items),
         "matched": len(selected),
+        # 时间窗内全站候选规模（去重）+ 本轮累计已返回多少：模型据此判断「够不够」，
+        # 不然它会一直换关键词试，试到 20 多次才发现今天根本没有更多新闻
+        "pool_window": len(window_urls),
+        "returned_so_far": len(state.items),
         "duplicates_removed": len(duplicates),
         "excluded_by_keyword": len(excluded),
         "out_of_date_range": out_of_range,
@@ -320,10 +384,16 @@ def search_news(args: SearchNewsArgs, ctx: ToolContext) -> ToolResult:
         "unmatched": unmatched,
     }
 
-    summary_parts = [
-        f"搜索「{args.keyword}」（{window.label}）：{len(result.ok_sources)}/{len(result.sources)} 个源可用，"
-        f"扫描 {len(result.items)} 条，返回 {len(selected)} 条"
-    ]
+    if browse:
+        summary_parts = [
+            f"浏览（{window.label}，不按关键词筛选）：{len(result.ok_sources)}/{len(result.sources)} 个源可用，"
+            f"扫描 {len(result.items)} 条，返回最新的 {len(selected)} 条"
+        ]
+    else:
+        summary_parts = [
+            f"搜索「{raw_keyword}」（{window.label}）：{len(result.ok_sources)}/{len(result.sources)} 个源可用，"
+            f"扫描 {len(result.items)} 条，返回 {len(selected)} 条"
+        ]
     details: list[str] = []
     if duplicates:
         details.append(f"去重 {len(duplicates)} 条")
@@ -336,10 +406,26 @@ def search_news(args: SearchNewsArgs, ctx: ToolContext) -> ToolResult:
     if details:
         summary_parts.append("，".join(details))
     if truncated:
-        summary_parts.append(f"另有 {len(candidates) - len(selected)} 条因条数上限未返回")
+        rest = len(candidates) - len(selected)
+        if browse:
+            summary_parts.append(
+                f"另有 {rest} 条未返回（清单有上限，避免塞满上下文）——"
+                "需要更多就用 sources 参数分源浏览，或按关键词补搜"
+            )
+        else:
+            summary_parts.append(f"另有 {rest} 条因条数上限未返回")
+
+    # 给模型一个「该不该收手」的硬数字：窗口内全站就这么些条，
+    # 继续换同义词也不会冒出新新闻
+    summary_parts.append(
+        f"窗口内全站候选 {len(window_urls)} 条（去重后），本轮累计已返回 {len(state.items)} 条"
+    )
 
     if not selected:
-        summary_parts.append("没有符合条件的新新闻——可换关键词/同义说法、放宽时间范围或调整排除词")
+        if browse:
+            summary_parts.append("时间窗内没有可用候选——可放宽时间范围（如 3d）或补充关键词")
+        else:
+            summary_parts.append("没有符合条件的新新闻——可换关键词/同义说法、放宽时间范围或调整排除词")
 
     if result.failed_sources:
         summary_parts.append(
@@ -347,7 +433,8 @@ def search_news(args: SearchNewsArgs, ctx: ToolContext) -> ToolResult:
         )
 
     payload = {
-        "keyword": args.keyword,
+        "mode": "browse" if browse else "keyword",
+        "keyword": raw_keyword or None,
         "date_range": window.to_dict(),
         "provider": provider.name,
         "items": selected,
@@ -357,10 +444,16 @@ def search_news(args: SearchNewsArgs, ctx: ToolContext) -> ToolResult:
         "source_reports": [report.to_dict() for report in result.sources],
         "truncated": truncated,
     }
+    if browse:
+        # 清单只给标题：明确告诉模型「要细节请读正文或补搜」，避免它以为这就是全部信息
+        payload["note"] = (
+            "浏览模式只返回标题/来源/时间/链接，不含摘要。"
+            "挑中哪几条请用 fetch_article 读正文；清单里没有的方向再用关键词补搜。"
+        )
 
     state.record_search(
         {
-            "keyword": args.keyword,
+            "keyword": raw_keyword or "（浏览模式）",
             "date_range": window.label,
             "returned": len(selected),
             "scanned": len(result.items),
@@ -395,6 +488,21 @@ def fetch_article(args: FetchArticleArgs, ctx: ToolContext) -> ToolResult:
     Returns:
         ToolResult，data.content 为正文/摘要，data.content_kind 标注完整程度。
     """
+    # 同一次运行里重复读同一篇：直接复用已抓到的正文。
+    # 实测模型会为「确认一下」把同一篇读两三遍，每次都是 1~3 秒的纯等待；
+    # 正文在这一轮内不会变，重复下载没有任何信息增量。
+    cached = ctx.news_state.cached_fetch(args.url)
+    if cached is not None:
+        title = cached.get("title") or "无标题"
+        return ToolResult.success(
+            tool="fetch_article",
+            summary=(
+                f"《{title}》本轮已抓取过，正文就是上一次返回的那份，"
+                "请直接使用，不要为同一个 URL 再调用 fetch_article（未重复下载）"
+            ),
+            data={**cached, "cached": True},
+        )
+
     outcome = news_http.fetch_text(
         args.url,
         timeout=settings.NEWS_FETCH_TIMEOUT,
@@ -492,6 +600,8 @@ def fetch_article(args: FetchArticleArgs, ctx: ToolContext) -> ToolResult:
             "word_count": article.word_count,
         },
     )
+    # 连同正文一起缓存：下一次对同一 URL 的调用直接命中，不再发网络请求
+    state.remember_payload(args.url, payload)
 
     summary = (
         f"已获取《{article.title or '无标题'}》（{article.site_name or '来源未知'}，"
@@ -510,20 +620,28 @@ def fetch_article(args: FetchArticleArgs, ctx: ToolContext) -> ToolResult:
 
 @tool_registry.tool(
     description=(
-        "把写好的新闻简报登记到数据库（同一用户同一天只保留一份，重复提交会覆盖旧版本）。"
+        "把写好的新闻简报一次性交付：结构校验 → 登记到数据库 → 导出 Markdown 文件到工作区。"
+        "同一用户同一天只保留一份，重复提交会覆盖旧版本。"
         "提交前会校验结构完整性与链接可信度：缺少必需章节、条目缺链接、"
         "或出现本轮检索之外凭空出现的链接时会被拒收，并在返回中说明缺什么。"
+        "**只需调用本工具一次，不要再用 write_file 写同一份内容。**"
     )
 )
 def save_briefing(args: SaveBriefingArgs, ctx: ToolContext) -> ToolResult:
-    """校验并保存简报。
+    """校验、入库并导出 Markdown。
+
+    为什么要自己落盘（而不是让模型先 write_file 再 save_briefing）：
+    两次调用意味着模型要**把同一份 6000 字的正文完整输出两遍**，
+    实测这两步占了单次生成约 70% 的耗时（23s + 13s，其中绝大部分是
+    重复的 out-token 生成，而不是磁盘 IO）。合并成一次调用后，
+    产物完全一致，但少了一整轮大文本生成。
 
     Args:
-        args: 用户 ID、Markdown 全文、可选标题/日期/条数/文件路径。
-        ctx: 执行上下文（提供数据库会话与候选链接白名单）。
+        args: 用户 ID、Markdown 全文、可选标题/日期/条数/导出路径。
+        ctx: 执行上下文（提供数据库会话、候选链接白名单与工作区）。
 
     Returns:
-        ToolResult，data 含 briefing_id、是否新建、条数与质量问题清单。
+        ToolResult，data 含 briefing_id、是否新建、条数、导出路径与质量问题清单。
     """
     report = parse_briefing(args.content)
 
@@ -605,10 +723,20 @@ def save_briefing(args: SaveBriefingArgs, ctx: ToolContext) -> ToolResult:
     if report.items_without_link:
         warnings.append(f"{len(report.items_without_link)} 条新闻缺链接")
 
+    # 入库成功后再导出 Markdown。落盘失败不回滚入库——数据已经在库里，
+    # 文件只是副本，把失败降级为 warning 让模型/调用方知情即可。
+    exported, export_error = _export_briefing_markdown(args.content, file_path, ctx)
+    if export_error:
+        warnings.append(f"Markdown 导出失败：{export_error}")
+
     summary = (
         f"{'新建' if created else '覆盖'}简报 #{briefing.id}（{_fmt_date(briefing_date)}，"
         f"{news_count} 条，用户 {user_id}）"
     )
+    if exported:
+        summary += f"，已导出 {file_path}"
+    else:
+        summary += "，Markdown 未导出"
 
     return ToolResult.success(
         tool="save_briefing",
@@ -621,11 +749,48 @@ def save_briefing(args: SaveBriefingArgs, ctx: ToolContext) -> ToolResult:
             "title": title,
             "news_count": news_count,
             "file_path": file_path,
+            "file_exported": exported,
             "link_count": len(report.links),
             "quality": report.to_dict(),
             "warnings": warnings,
         },
     )
+
+
+def _export_briefing_markdown(
+    content: str, file_path: str, ctx: ToolContext
+) -> tuple[bool, str | None]:
+    """把简报正文写到工作区内的 Markdown 文件。
+
+    Args:
+        content: Markdown 全文。
+        file_path: 工作区内的相对路径。
+        ctx: 执行上下文（提供工作区与写入上限）。
+
+    Returns:
+        (是否写入成功, 失败原因)；成功时失败原因为 None。
+    """
+    try:
+        target = ctx.resolve(file_path)
+    except SafetyViolation as exc:
+        return False, exc.message
+
+    if target.is_dir():
+        return False, f"{file_path} 是一个目录"
+
+    payload = content.encode("utf-8")
+    if len(payload) > ctx.write_max_bytes:
+        return False, f"内容 {len(payload)} 字节超过单次写入上限 {ctx.write_max_bytes} 字节"
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+    except OSError as exc:
+        logger.warning("简报 Markdown 导出失败：%s", exc)
+        return False, f"{type(exc).__name__}: {exc}"
+
+    return True, None
 
 
 def _resolve_date(raw: str | None, ctx: ToolContext) -> date | None:

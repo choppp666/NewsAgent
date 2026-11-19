@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, time, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -108,43 +108,55 @@ def build_briefing_task(
     *,
     focus: str | None = None,
     today: date | None = None,
+    llm_label: str | None = None,
 ) -> str:
     """把「用户画像 + 交付要求」写成给 Agent 的自然语言任务。
 
     注意：这里刻意不写「先调用 X，再调用 Y」。
     模型需要自己决定搜几次、搜什么词、读不读原文、够不够写。
+
+    Args:
+        profile: 用户画像。
+        briefing_date: 简报日期。
+        focus: 本次额外关注点。
+        today: 当前日期（默认取系统日期），用于提示模型「今天」是哪天。
+        llm_label: 真实模型标识（如 `gpt-4o-mini`）。给了就在简报抬头写一条
+            「生成方式：Agent 模式」，让读者一眼看出这份简报是谁写的、相关性怎么判断。
+            离线策略（mock）传 None —— 那种模式下抬头由 `mock_news` 自己拼，
+            文案里会明确写「离线策略」，两种模式的说明不会互相冒充。
     """
     current = today or date.today()
     relative = briefing_relative_path(profile.user_id, briefing_date)
+
+    # 覆盖时段 = 「过去 24 小时」，而不是「今天 00:00 之后」。
+    # 原因是资讯站按滚动 24 小时更新，而简报默认在早上 08:00 生成——那个时点
+    # 「今天」这个窗口只覆盖 0:00~8:00，几乎抓不到东西，模型只能反复换关键词硬试
+    # （实测一轮搜了 19~29 次，命中率极低）。按 24 小时算，08:00 的窗口正好是
+    # 昨天 08:00 → 今天 08:00，是一个完整的新闻日。
+    now = datetime.now().replace(microsecond=0)
+    if briefing_date == now.date():
+        window_end = now
+    else:  # 补生成历史日期时，用当天的收尾时刻，避免「用现在的窗口写昨天的简报」
+        window_end = datetime.combine(briefing_date, time(hour=23, minute=59))
+    window_start = window_end - timedelta(hours=24)
+    coverage = (
+        f"{window_start:%Y-%m-%d %H:%M} ~ {window_end:%Y-%m-%d %H:%M}"
+        f"（过去 24 小时，检索请用 date_range=last_24h）"
+    )
 
     topics = "、".join(profile.topics) or "（未设置）"
     keywords = "、".join(profile.keywords) or "（未设置）"
     excludes = "、".join(profile.exclude_keywords) or "（无）"
 
-    lines: list[str] = [
-        f"请为我生成 {briefing_date.isoformat()} 的每日 AI 新闻简报。",
-        "",
-        "【用户信息】",
-        f"- user_id：{profile.user_id}",
-        f"- 昵称：{profile.nickname}",
-        f"- 身份/职业：{profile.identity}",
-        f"- 关注话题：{topics}",
-        f"- 关键词：{keywords}",
-        f"- 排除关键词：{excludes}",
-        f"- 今天是：{current.isoformat()}（简报只关心 {briefing_date.isoformat()} 当天及最近的新闻）",
-    ]
-    if focus:
-        lines.append(f"- 本次额外关注：{focus}")
-
-    lines += [
-        "",
-        "【交付物】",
-        f"1. 用 write_file 把 Markdown 简报保存到工作区 `{relative}`。",
-        "2. 调用 save_briefing 把同一份内容登记进数据库（同一用户同一天只保留一份，重复生成会覆盖）。",
-        "",
-        "【简报结构】",
-        "# 每日 AI 新闻简报",
-        "- 简报日期：YYYY-MM-DD",
+    structure: list[str] = ["# 每日 AI 新闻简报"]
+    if llm_label:
+        structure.append(
+            f"> 生成方式：Agent 模式（{llm_label}）。条目、来源与链接均来自真实 RSS 检索结果，"
+            "相关性由模型按语义判断，摘要与解读由模型撰写。"
+        )
+    structure += [
+        f"- 简报日期：{briefing_date.isoformat()}",
+        f"- 覆盖时段：{window_start:%Y-%m-%d %H:%M} ~ {window_end:%Y-%m-%d %H:%M}（过去 24 小时）",
         "- 用户关注方向：…",
         "- 今日新闻数量：N",
         "## 今日重点新闻",
@@ -157,8 +169,42 @@ def build_briefing_task(
         "- 发布时间：",
         "## 行业动态总结",
         "## 今日值得关注",
+    ]
+
+    lines: list[str] = [
+        f"请为我生成 {briefing_date.isoformat()} 的每日 AI 新闻简报。",
+        "",
+        "【用户信息】",
+        f"- user_id：{profile.user_id}",
+        f"- 昵称：{profile.nickname}",
+        f"- 身份/职业：{profile.identity}",
+        f"- 关注话题：{topics}",
+        f"- 关键词：{keywords}",
+        f"- 排除关键词：{excludes}",
+        f"- 今天是：{current.isoformat()}（生成时刻 {now:%H:%M}）",
+        f"- 简报覆盖时段：{coverage}",
+    ]
+    if focus:
+        lines.append(f"- 本次额外关注：{focus}")
+
+    lines += [
+        "",
+        "【交付物】",
+        "调用一次 save_briefing，把完整 Markdown 正文作为 content 传进去："
+        f"它会校验结构、登记入库，并把同一份内容导出到工作区 `{relative}`。",
+        "**不要再用 write_file 写一遍同样的内容**——那样等于把几千字正文重复生成两次，"
+        "既慢又可能两份不一致。save_briefing 的返回里会告诉你是否导出成功。",
+        "",
+        "【简报结构】",
+        *structure,
         "",
         "【判断原则】（这些是约束，不是步骤；具体怎么搜、搜几次、读不读原文由你决定）",
+        "- 先看全貌再下钻：**先调用一次 `search_news` 且不传 keyword**（浏览模式），"
+        "一次拿到时间窗内全部候选清单，从里面挑 3~6 条最相关的读正文；"
+        "只有清单里明显缺某个方向时，再用关键词补搜，且补搜不超过 2 次。"
+        "不要用十几个关键词反复试探——清单已经把「今天有什么」摆在你面前了。",
+        "- 时间窗口用「过去 24 小时」（`date_range=last_24h`）：早上生成时「今天 0 点之后」"
+        "几乎没有内容，只挑当天会漏掉昨天下午的高价值报道；确实需要更早的再放宽到 3d 并说明原因。",
         "- 相关性按语义判断：用户的关注点是「他想做什么」，不要只做字面关键词匹配，"
         "也要识别同义说法、上位/下位概念与英文表述。",
         "- 只写工具真实返回的新闻。来源、链接、发布时间必须有出处；确实拿不到的写「未获取到」，不许推测。",

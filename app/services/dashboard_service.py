@@ -18,7 +18,7 @@ from app.core.exceptions import NotFoundError
 from app.crud import briefing as briefing_crud
 from app.crud import push as push_crud
 from app.crud import task as task_crud
-from app.schemas.push import PushRecordOut
+from app.schemas.push import PushRecordOut, PushSettingsOut
 from app.schemas.subscription import SubscriptionOut
 from app.schemas.task import DashboardOut, DashboardStatsOut, SchedulerInfoOut, TaskOut
 from app.schemas.user import UserOut
@@ -84,6 +84,8 @@ def build_dashboard(db: Session, user_id: int, *, include_scheduler: bool = True
             else None
         ),
         latest_push=PushRecordOut.from_model(latest_push) if latest_push else None,
+        # 附带「能不能真的发信」：概览页要能回答「为什么我没收到邮件」
+        push=PushSettingsOut.from_user(user),
         running_task=(
             TaskOut.from_model(running_view.task, briefing=running_view.briefing, push=running_view.push)
             if running_view

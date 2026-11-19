@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -68,9 +69,32 @@ class PushSettingsOut(BaseModel):
     email: str | None = None
     global_enabled: bool = Field(description="服务端全局推送开关 PUSH_ENABLED")
     smtp_configured: bool = Field(description="SMTP_HOST 等是否已配置")
+    smtp_missing: list[str] = Field(
+        default_factory=list,
+        description="缺少的 SMTP 配置项（前端直接展示，避免用户对着「未配置」四个字猜）",
+    )
     sender: str | None = Field(default=None, description="发件人地址（不含密码）")
 
     @property
     def deliverable(self) -> bool:
         """三个条件同时满足才会真的发信。"""
         return bool(self.push_enabled and self.email and self.global_enabled and self.smtp_configured)
+
+    @classmethod
+    def from_user(cls, user: Any) -> PushSettingsOut:
+        """按「当前用户 + 当前服务端配置」组装。
+
+        统一收在这里，是因为概览接口和推送设置接口都要返回同一份信息；
+        分别拼装很容易出现「一处补了新字段、另一处忘了」的漂移。
+        """
+        from app.core.config import settings
+
+        return cls(
+            user_id=user.id,
+            push_enabled=bool(user.push_enabled),
+            email=user.email,
+            global_enabled=bool(settings.PUSH_ENABLED),
+            smtp_configured=settings.smtp_configured,
+            smtp_missing=settings.smtp_missing_items,
+            sender=settings.smtp_sender_address or None,
+        )

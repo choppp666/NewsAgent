@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import threading
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -123,6 +124,42 @@ def ensure_url_allowed(url: str) -> str:
     return text
 
 
+# ---------------------------------------------------------------- 连接复用
+# 为什么复用 Client：每次抓取新建 Client 都要重新做 TCP + TLS 握手，
+# 一批 10 个源、一次运行搜 5 次就是 50 次握手，白花几百毫秒到几秒。
+# httpx.Client 本身是线程安全的，这里做成进程级单例即可。
+_CLIENT_LOCK = threading.Lock()
+_shared_client: httpx.Client | None = None
+
+
+def _get_client() -> httpx.Client:
+    """取共享的 httpx.Client（惰性创建，线程安全）。"""
+    global _shared_client
+    with _CLIENT_LOCK:
+        if _shared_client is None or _shared_client.is_closed:
+            _shared_client = httpx.Client(
+                follow_redirects=True,
+                headers={
+                    "User-Agent": DEFAULT_USER_AGENT,
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                },
+                # 默认超时只是兜底，实际每次请求会按入参覆盖
+                timeout=httpx.Timeout(12.0),
+                # 连接池按「并发抓取 6 路 + 若干正文抓取」估算，留一点余量
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            )
+        return _shared_client
+
+
+def close_shared_client() -> None:
+    """关闭共享连接池（服务关闭 / 测试清理时调用）。"""
+    global _shared_client
+    with _CLIENT_LOCK:
+        if _shared_client is not None:
+            _shared_client.close()
+            _shared_client = None
+
+
 def _decode(content: bytes, content_type: str) -> str:
     """按响应头 charset 解码，失败则依次尝试常见编码。"""
     charset = ""
@@ -174,40 +211,39 @@ def fetch_text(
     }
 
     try:
-        with httpx.Client(
-            timeout=httpx.Timeout(timeout),
-            follow_redirects=True,
+        with _get_client().stream(
+            "GET",
+            safe_url,
             headers=headers,
-            # 部分资讯站的证书链在 Windows 上缺失中间证书，这里不放开校验，
-            # 失败时如实报错，避免「看起来抓到了」的假象。
-        ) as client:
-            with client.stream("GET", safe_url) as response:
-                status_code = response.status_code
-                content_type = response.headers.get("content-type", "")
-                final_url = str(response.url)
+            # 按入参覆盖超时：正文抓取与 Feed 抓取的容忍度不同
+            timeout=httpx.Timeout(timeout),
+        ) as response:
+            status_code = response.status_code
+            content_type = response.headers.get("content-type", "")
+            final_url = str(response.url)
 
-                if status_code >= 400:
-                    return FetchOutcome(
-                        ok=False,
-                        url=url,
-                        final_url=final_url,
-                        status_code=status_code,
-                        text="",
-                        content_type=content_type,
-                        size=0,
-                        error=f"HTTP {status_code}",
-                    )
+            if status_code >= 400:
+                return FetchOutcome(
+                    ok=False,
+                    url=url,
+                    final_url=final_url,
+                    status_code=status_code,
+                    text="",
+                    content_type=content_type,
+                    size=0,
+                    error=f"HTTP {status_code}",
+                )
 
-                chunks: list[bytes] = []
-                size = 0
-                truncated = False
-                for chunk in response.iter_bytes():
-                    chunks.append(chunk)
-                    size += len(chunk)
-                    if size >= max_bytes:
-                        truncated = True
-                        break
-                content = b"".join(chunks)[:max_bytes]
+            chunks: list[bytes] = []
+            size = 0
+            truncated = False
+            for chunk in response.iter_bytes():
+                chunks.append(chunk)
+                size += len(chunk)
+                if size >= max_bytes:
+                    truncated = True
+                    break
+            content = b"".join(chunks)[:max_bytes]
 
     except httpx.TimeoutException:
         return FetchOutcome(

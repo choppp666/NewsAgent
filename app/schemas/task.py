@@ -8,7 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from app.schemas.briefing import BriefingOut, BriefingSummaryOut
-from app.schemas.push import PushRecordOut
+from app.schemas.push import PushRecordOut, PushSettingsOut
 from app.schemas.subscription import SubscriptionOut
 from app.schemas.user import UserOut
 
@@ -139,6 +139,10 @@ class DashboardOut(BaseModel):
     running_task: TaskOut | None = Field(default=None, description="当前正在生成的任务（前端据此恢复轮询）")
     stats: DashboardStatsOut = Field(default_factory=DashboardStatsOut)
     scheduler: SchedulerInfoOut | None = None
+    push: PushSettingsOut | None = Field(
+        default=None,
+        description="推送可达性（含缺失的 SMTP 配置项），前端据此解释「为什么收不到邮件」",
+    )
 
 
 class TaskDetailOut(BaseModel):

@@ -299,3 +299,113 @@ def test_run_record_serializable(ctx: ToolContext) -> None:
     assert payload["status"] == "completed"
     assert payload["tool_calls"][0]["tool"] == "list_dir"
     json.dumps(payload, ensure_ascii=False)  # 不抛异常即为可序列化
+# ---------------------------------------------------------------- 上下文预算
+
+
+def test_context_budget_compacts_early_tool_results(monkeypatch, workspace, ctx) -> None:
+    """超预算时先压最早的：最近一条保持全文（模型正基于它做决策）。
+
+    背景：单条结果上限 12k 字符挡不住「8 轮 × 多次调用」的累积，
+    十几个工具结果就能把上下文推到十几万字符，既逼近窗口上限也直接烧钱。
+    """
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "AGENT_CONTEXT_BUDGET_CHARS", 14_000)
+    monkeypatch.setattr(settings, "AGENT_TOOL_RESULT_KEEP_FULL", 1)
+
+    (workspace / "big.md").write_text("重要事实，需要保留。" * 700, encoding="utf-8")  # ≈7k 字符
+
+    llm = ScriptedLLM(
+        steps=[{"tool": "read_file", "args": {"path": "big.md"}} for _ in range(3)]
+        + [{"content": "读完了"}]
+    )
+    record = run(llm, "把 big.md 读三遍", ctx)
+
+    assert record.status == "completed"
+    tool_messages = [m for m in llm.history[-1] if m.get("role") == "tool"]
+    assert len(tool_messages) == 3, "压缩只替换 content，不能删消息（否则 tool_call_id 配不上）"
+
+    assert '"compacted": true' in tool_messages[0]["content"], "最早的应被压缩"
+    assert '"compacted": true' not in tool_messages[-1]["content"], "最近一条应保持全文"
+    assert len(tool_messages[0]["content"]) < len(tool_messages[-1]["content"])
+
+
+def test_context_budget_holds_under_heavy_tool_output(monkeypatch, workspace, ctx) -> None:
+    """极端情况：8 轮大结果（合计 5 万+ 字符）也必须压回预算内。
+
+    这是真实运行里发现的缺口：只压「最近 N 条之外」的旧结果时，
+    若最新几条本身就占满预算，总账仍然超预算，每一轮都在超标状态下发请求。
+    """
+    from app.core.config import settings
+
+    budget = 12_000
+    monkeypatch.setattr(settings, "AGENT_CONTEXT_BUDGET_CHARS", budget)
+    monkeypatch.setattr(settings, "AGENT_TOOL_RESULT_KEEP_FULL", 2)
+
+    (workspace / "big.md").write_text("事实需要保留。" * 700, encoding="utf-8")  # ≈7k 字符
+
+    llm = ScriptedLLM(
+        steps=[{"tool": "read_file", "args": {"path": "big.md"}} for _ in range(8)]
+        + [{"content": "读完了"}]
+    )
+    # 8 轮工具 + 1 轮收尾，轮数上限要给到 9，否则会被 max_steps 截断
+    record = run(llm, "把 big.md 读八遍", ctx, max_steps=9)
+
+    assert record.status == "completed"
+    last_view = llm.history[-1]
+    total = sum(len(str(message.get("content") or "")) for message in last_view)
+    assert total <= budget, f"上下文仍超预算：{total} > {budget}"
+
+    tool_messages = [m for m in last_view if m.get("role") == "tool"]
+    compacted = [m for m in tool_messages if '"compacted": true' in m["content"]]
+    assert len(compacted) >= len(tool_messages) - 1, "兜底时最近几条也要压"
+
+
+def test_context_budget_disabled_keeps_everything(monkeypatch, workspace, ctx) -> None:
+    """预算设 0 时回退旧行为：一条都不压缩（排障时想看完整上下文）。"""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "AGENT_CONTEXT_BUDGET_CHARS", 0)
+
+    (workspace / "big.md").write_text("重要事实。" * 900, encoding="utf-8")
+
+    llm = ScriptedLLM(
+        steps=[{"tool": "read_file", "args": {"path": "big.md"}} for _ in range(3)]
+        + [{"content": "读完了"}]
+    )
+    record = run(llm, "把 big.md 读三遍", ctx)
+
+    assert record.status == "completed"
+    tool_messages = [m for m in llm.history[-1] if m.get("role") == "tool"]
+    assert all('"compacted"' not in m["content"] for m in tool_messages)
+
+
+def test_context_budget_uses_stubs_when_tool_calls_are_many(monkeypatch, workspace, ctx) -> None:
+    """工具调用太多时（真实运行里出现过 40 次），最老的结果压成「只剩调用记录」的存根。
+
+    只有两档压缩时会出现「每条都压缩过、总量仍超预算」：40 条 × 每条几百字符
+    就已经把 4 万字符吃掉。第三档兜底保证总量真的落回预算内。
+    """
+    from app.core.config import settings
+
+    budget = 8_000
+    monkeypatch.setattr(settings, "AGENT_CONTEXT_BUDGET_CHARS", budget)
+    monkeypatch.setattr(settings, "AGENT_TOOL_RESULT_KEEP_FULL", 1)
+
+    (workspace / "big.md").write_text("事实需要保留。" * 700, encoding="utf-8")  # ≈7k 字符
+
+    llm = ScriptedLLM(
+        steps=[{"tool": "read_file", "args": {"path": "big.md"}} for _ in range(12)]
+        + [{"content": "读完了"}]
+    )
+    record = run(llm, "把 big.md 读十二遍", ctx, max_steps=13)
+
+    assert record.status == "completed"
+    tool_messages = [m for m in llm.history[-1] if m.get("role") == "tool"]
+    total = sum(len(str(m.get("content") or "")) for m in tool_messages)
+    assert total <= budget, f"上下文仍超预算：{total} > {budget}"
+
+    stubs = [m for m in tool_messages if '"compacted": "stub"' in m["content"]]
+    assert stubs, "调用次数多时应触发存根压缩"
+    # 存根必须明确标注，模型才知道「这些是压缩过的，需要可重新取」
+    assert "只保留调用记录" in stubs[0]["content"]

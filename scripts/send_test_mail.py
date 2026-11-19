@@ -191,8 +191,13 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="只预览内容，不发送")
     args = parser.parse_args()
 
-    if not _print_config():
+    configured = _print_config()
+    if not configured and not (args.dry_run and args.user_id):
         return 2
+    if not configured:
+        # 预览邮件内容不需要真的能发信：很多人是先看看「发出去长什么样」，
+        # 再去申请授权码。这里不给配置缺失挡路。
+        print("\n（--dry-run 只预览内容，不要求 SMTP 配置齐全）")
 
     if args.to:
         return _smtp_test(args.to)

@@ -60,7 +60,7 @@
    │ AgentRunner：发请求 → 解析 → 执行 → 回填       │──▶│ RSS 抓取 / 正文抽取 / 去重 /     │
    │ 工具注册中心（9 个工具）/ 护栏 / 轨迹           │   │ 时间过滤 / 关键词打分 / 简报校验  │
    └───────────────┬───────────────────────────────┘   └─────────────────────────────────┘
-                   │ ④ save_briefing 写库 + write_file 落盘
+                   │ ④ save_briefing 写库 + 落盘（一次调用完成）
                    ▼
    ┌──────── 存储（SQLite）────────┐         ┌──── 推送（app/push）────┐
    │ users / subscriptions /       │────────▶│ 邮件模板 → SMTP → 状态   │
@@ -750,12 +750,12 @@ http://127.0.0.1:8000/?user_id=4    # 用户 B：大模型 / AI 编程
 | `list_dir` | `path` / `recursive` / `max_depth` / `show_hidden` | 列出沙箱内目录结构 | 探查工作区里有什么 |
 | `read_file` | `path` / `start_line` / `max_lines` | 读文本文件（编码探测、二进制拒读） | 看已有笔记 / 简报模板 |
 | `search_content` | `keyword` / `dir` / `glob` / `case_sensitive` | 在沙箱内全文检索 | 找含关键字的文件 |
-| `write_file` | `path` / `content` / `mode(overwrite/append)` | 写文件（父目录自动创建） | 把简报落成 `briefings/日期-userID.md` |
+| `write_file` | `path` / `content` / `mode(overwrite/append)` | 写文件（父目录自动创建） | 通用任务产出文件（简报不走这条，见下） |
 | `bash` | `command` / `timeout` | 执行白名单内只读命令 | 需要 `ls` / `grep` 等命令行时 |
 | `get_user_preferences` | `user_id` | 从库里读身份、话题、关键词、排除词 | 生成简报前**先拿真实偏好**，而不是靠任务描述里的转述 |
 | `search_news` | `keyword` / `date_range` / `exclude_keywords` / `sources` / `max_items` / `only_new` | 多源并发搜索 + 时间过滤 + 排除词 + 去重 + 打分 | 每个关注方向搜一次；信息不足时换角度重搜 |
 | `fetch_article` | `url` / `max_chars` | 抓详情页正文（去噪 → 段落 → 密度兜底） | 标题不够判断重要性时读原文 |
-| `save_briefing` | `user_id` / `content` / `title` / `briefing_date` / `news_count` / `file_path` | 结构校验 + 链接溯源 + 按「用户+日期」upsert 入库 | 写完文件后登记进数据库 |
+| `save_briefing` | `user_id` / `content` / `title` / `briefing_date` / `news_count` / `file_path` | 结构校验 + 链接溯源 + 按「用户+日期」upsert 入库 + 导出 Markdown 到 `briefings/日期-userID.md` | 一次交付：写完直接入库并落盘，不需要再用 `write_file` 写一遍 |
 
 ### 10.5 工具注册中心
 
@@ -815,6 +815,8 @@ def list_dir(args: ListDirArgs, ctx: ToolContext) -> ToolResult:
 | `AGENT_LLM_TIMEOUT` / `AGENT_LLM_RETRIES` | 60 / 2 | 单次请求超时与重试次数 |
 | `AGENT_BASH_TIMEOUT` / `AGENT_BASH_TIMEOUT_MAX` | 10 / 60 | 命令超时 |
 | `AGENT_TOOL_RESULT_LIMIT` | 12000 | 单条工具结果回填上限（字符） |
+| `AGENT_CONTEXT_BUDGET_CHARS` | 40000 | 一次运行的工具结果总字符预算；超了就把最早的压成精简版（0 = 关闭压缩） |
+| `AGENT_TOOL_RESULT_KEEP_FULL` | 3 | 压缩时始终保留全文的最近 N 条工具结果 |
 
 ### 10.8 接口与调试
 
@@ -924,11 +926,34 @@ python scripts/agent_demo.py                 # 有 key 时自动用真实模型
 | --- | --- | --- | --- |
 | `get_user_preferences` | `user_id` | 从 SQLite 读身份、话题、关键词、排除词 | 用户不存在 → 404 错误码而非异常 |
 | `search_news` | `keyword`、`date_range`、`exclude_keywords`、`sources`、`max_items`、`only_new` | 多源并发搜索 + 时间过滤 + 排除词 + 去重 + 打分排序 | 全部源失败 → 明确报错并提示「不要编造」；单源失败只作降级记录；结果带 `source_reports` 与 `stats` |
-| `fetch_article` | `url`、`max_chars` | 抓详情页，抽标题/来源/时间/正文 | HTTP 错误、非 HTML、页面无正文、内网地址一律失败并说明；返回 `content_kind` 与 `warnings` |
-| `save_briefing` | `user_id`、`content`、`briefing_date`… | 校验后按「用户+日期」upsert | 结构不全 → 拒收并列出缺失项；链接不在本轮检索结果内 → 拒收并给出可用链接 |
+| `fetch_article` | `url`、`max_chars` | 抓详情页，抽标题/来源/时间/正文 | HTTP 错误、非 HTML、页面无正文、内网地址一律失败并说明；返回 `content_kind` 与 `warnings`；**同一轮重复读同一篇命中内存缓存，不重复下载** |
+| `save_briefing` | `user_id`、`content`、`briefing_date`、`file_path`… | 校验后按「用户+日期」upsert，并自己把 Markdown 导出到工作区 | 结构不全 → 拒收并列出缺失项；链接不在本轮检索结果内 → 拒收并给出可用链接；路径越界/超限 → 只降级为 warning，不影响入库 |
 
 工具描述（LLM 靠它选工具）里写明了幂等语义、能返回什么、什么时候该放弃，例如
 `search_news` 会明确说「一次搜索只覆盖一个关键词，多个主题应分多次搜索」。
+
+#### `search_news` 的两种模式
+
+| 模式 | 怎么触发 | 返回什么 | 什么时候用 |
+| --- | --- | --- | --- |
+| 浏览 | **不传 `keyword`** | 时间窗内全部候选，按发布时间倒序，只给标题/来源/时间/链接（不带摘要） | 每次生成**先来一次**，一眼看清「今天有什么」，再挑 3~6 条读正文 |
+| 关键词 | 传 `keyword` | 按相关度打分后的候选，带摘要与命中词 | 清单里明显缺某个方向时定向补搜，通常 0~2 次 |
+
+为什么要有浏览模式：关键词模式一次只覆盖一个概念，早期实现里模型只能不断换词试探——
+实测一次生成搜 19~29 次、撞上 `max_steps` 才收尾，而候选中真正相关的只有几条。
+浏览模式把「目录」一次性摆出来，模型的工作从「猜关键词」变成「在清单里挑」：
+
+| 指标（demo 用户 B，DeepSeek） | 只有关键词模式 | 加入浏览模式 |
+| --- | --- | --- |
+| 搜索调用 | 19~29 次 | **4~5 次** |
+| Agent 轮数 | 15 | **8** |
+| 工具调用总数 | 37 | **13~15** |
+| 单次生成耗时 | 62~74s | **51s** |
+
+清单条数由 `NEWS_BROWSE_MAX_ITEMS`（默认 40）封顶，模型要求更多也不放大：
+清单里的每一条都会被后续每一轮重新发送，60 条就能把上下文推到 4 万字符。
+清单里没给全时，摘要会提示「用 sources 分源浏览或按关键词补搜」，避免它重复浏览同一个窗口。
+
 
 ### 11.4 个性化筛选：机械判断与语义判断的分工
 
@@ -1011,10 +1036,13 @@ curl http://127.0.0.1:8000/api/v1/briefings/1
   {"index":2,"tool":"search_news","arguments":{"keyword":"AI Agent","date_range":"today"},"ok":true},
   {"index":3,"tool":"search_news","arguments":{"keyword":"MCP","date_range":"today"},"ok":true},
   {"index":4,"tool":"fetch_article","arguments":{"url":"https://..."},"ok":true},
-  {"index":5,"tool":"write_file","arguments":{"path":"briefings/2026-11-18-user1.md"},"ok":true},
-  {"index":6,"tool":"save_briefing","arguments":{"user_id":1},"ok":true}
+  {"index":5,"tool":"save_briefing","arguments":{"user_id":1,"file_path":"briefings/2026-11-18-user1.md"},"ok":true,"summary":"新建简报 #1（2026-11-18，4 条，用户 1），已导出 briefings/2026-11-18-user1.md"}
 ]
 ```
+
+> 早期版本这里是 `fetch_article → write_file → save_briefing` 三条：
+> 模型要把同一份正文生成两遍。现在落盘由 `save_briefing` 自己做，
+> 轨迹里不会再出现 `write_file`。若在旧轨迹里看到它，属于历史记录。
 
 ### 11.8 配置项（第三阶段新增）
 
@@ -1023,9 +1051,11 @@ curl http://127.0.0.1:8000/api/v1/briefings/1
 | `NEWS_PROVIDER` | `rss` | 搜索提供方；注册新服务后改这里切全局，未知名字回退 `rss` |
 | `NEWS_FEEDS` | 空（用内置 10 个源） | 逗号分隔的源 ID，如 `qbitai,openai` |
 | `NEWS_MAX_ITEMS_PER_FEED` | 30 | 单源最多读取条数 |
+| `NEWS_FEED_CACHE_TTL` | 300 | RSS 抓取的进程内缓存时长（秒）；一次运行多次搜索只真抓一次，0 = 关闭 |
 | `NEWS_FETCH_TIMEOUT` | 12.0 | 抓取超时（秒） |
 | `NEWS_HTTP_MAX_BYTES` | 3000000 | 单个响应体上限（OpenAI 的 Feed 有 800KB+） |
-| `NEWS_SEARCH_MAX_ITEMS` | 12 | `search_news` 默认返回上限 |
+| `NEWS_SEARCH_MAX_ITEMS` | 12 | `search_news` 关键词模式默认返回上限 |
+| `NEWS_BROWSE_MAX_ITEMS` | 40 | `search_news` 浏览模式（不传 keyword）单次返回上限 |
 | `NEWS_ARTICLE_MAX_CHARS` | 6000 | `fetch_article` 正文上限 |
 | `NEWS_TITLE_SIMILARITY` | 0.9 | 判定「同一条新闻」的标题相似度阈值 |
 | `BRIEFING_OUTPUT_DIR` | `briefings` | 简报在 workspace 内的子目录 |
@@ -1113,7 +1143,9 @@ python scripts/briefing_demo.py --user A --mode openai
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| `search_news` 返回 0 条但明明有新闻 | `date_range=today` 太严，或命中排除词 | 看 `stats` 里的 `out_of_date_range` / `excluded_by_keyword`，换 `3d` 或换词 |
+| `search_news` 返回 0 条但明明有新闻 | 时间窗过窄（`today`），或命中排除词 | 「今天」只覆盖 0 点之后，早上生成时几乎没内容；用默认的 `last_24h`，并看 `stats.out_of_date_range` / `excluded_by_keyword` |
+| 模型反复换关键词搜十几次 | 它不知道「池子里一共只有几条」 | 看 `stats.pool_window`：这是时间窗内全站候选总数，接近 `returned_so_far` 就该收手 |
+| 启动日志显示 `实际模式=mock` | `LLM_API_KEY` 没读到 | 密钥放 `.env.local`（覆盖 `.env`）；指纹 `sk-xxx***#hash` 变了说明文件被改过 |
 | 所有源都 403 | UA 被拦，或本机代理拦截 | 已伪装浏览器 UA；检查网络/代理设置 |
 | `fetch_article` 总是 `content_kind=summary` | 站点正文由 JS 渲染（无 `<p>`） | 属预期行为，简报中会标注「正文未获取」 |
 | 简报被拒「链接不在检索结果内」 | 模型自己拼了 URL | 用返回的 `allowed_urls` 改写；这是设计行为 |
@@ -1150,8 +1182,8 @@ python scripts/briefing_demo.py --user A --mode openai
         │
         ├─ 读用户画像（第三阶段 briefing_service.get_user_profile）
         ├─ run_briefing(...)  ← 完全复用第三阶段：同一个 AgentRunner、同一套工具
-        │     Agent 自主：get_user_preferences → search_news ×N → fetch_article ×M → write_file → save_briefing
-        ├─ 简报入库 + Markdown 落盘
+        │     Agent 自主：get_user_preferences → search_news ×N → fetch_article ×M → save_briefing
+        ├─ 简报入库 + Markdown 落盘（同一次 save_briefing 内完成）
         └─ 标记 task = success
         │
         ▼
@@ -1470,13 +1502,31 @@ curl -X POST http://127.0.0.1:8000/api/v1/scheduler/run-now
 | 环节 | 结果 |
 | --- | --- |
 | 手动触发 → 入队 | `action=created`，任务 `pending`，按钮立即禁用 |
-| Agent 执行 | 6 轮 / 6 次工具调用：`get_user_preferences → search_news ×2 → fetch_article → write_file → save_briefing`，约 5 秒 |
+| Agent 执行 | 6 轮 / 6 次工具调用：`get_user_preferences → search_news ×2 → fetch_article → write_file → save_briefing`，约 5 秒（**旧流程**：入库与落盘分两次调用，见 12.11.1） |
 | 简报入库 | `news_count=4`，文件落盘 `workspace/briefings/2026-11-18-userN.md` |
 | 邮件推送 | 本地 SMTP 收下完整 MIME 邮件，主题 `【AI 新闻简报】2026-11-18 · 每日 AI 新闻简报`，含 4 条摘要与 4 个原始链接 |
 | 前端列表 | `2026-11-18 \| 每日 AI 新闻简报 \| 4 条 \| 生成成功 \| 已发送 \| 查看` |
 | 重复点击 | 第二次触发返回 `already_generated`，只入队一次 |
 | 重启补跑 | 启动日志：`启动补跑完成：提交 0，跳过 5，失败 0`（5 个用户当天均已有结论） |
 | 僵尸任务自愈 | 两个任务因进程重启停在 `running`，心跳过期后 `POST /scheduler/recover` 返回`回收 2 个僵尸任务，重新派发 2 个`，两个任务最终 `success`（attempts=2、各 4 条新闻、推送 success） |
+
+### 12.11.1 交付合并后的复测（真实 DeepSeek，浏览模式）
+
+改动点：`save_briefing` 自己把 Markdown 写入工作区，模型不再需要用 `write_file`
+把同一份几千字正文**再生成一遍**（这一步曾占单次生成约 70% 的耗时）。
+下面是一次真实运行（`python -m scripts.briefing_demo --mode openai`）的数据：
+
+| 环节 | 用户 A（AI Agent / MCP） | 用户 B（大模型 / AI 编程） |
+| --- | --- | --- |
+| 轮数 / 工具调用 | 9 轮 / 18 次 | 8 轮 / 16 次 |
+| 搜索次数 | 7 次（1 次浏览 + 6 次补搜） | 5 次（1 次浏览 + 4 次补搜） |
+| 抓正文 | 10 次（其中 3 次命中同轮缓存） | 9 次（其中 3 次命中同轮缓存） |
+| 端到端耗时 | 46.7 s | 33.6 s |
+| 交付 | 1 次 `save_briefing`：入库 + 导出 12.5 KB Markdown，轨迹里没有 `write_file` | 1 次 `save_briefing`：入库 + 导出 8.6 KB Markdown |
+
+省下来的是**一整轮大文本输出**（约 3000~4000 个 out-token），而不是磁盘 IO——
+写本地文件本身只有几毫秒。端到端耗时仍主要取决于模型自己决定搜几次、读几篇：
+A 这次多搜了 3 次、多读了 3 篇，所以绝对耗时反而高于更早那轮。
 
 ### 12.12 常见问题（第四阶段新增）
 

@@ -168,7 +168,10 @@ def parse_briefing(content: str) -> BriefingReport:
     if not report.title:
         report.issues.append("缺少一级标题（# 每日 AI 新闻简报）")
 
-    date_match = _DATE_RE.search(text)
+    # 优先取「简报日期：」后面的日期。正文里可能先出现别的日期（例如「覆盖时段：
+    # 2026-11-18 08:00 ~ 2026-11-19 08:00」或新闻发布时间），直接抓全文第一个日期会张冠李戴。
+    labeled_date = re.search(r"简报日期\s*[：:]\s*(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})", text)
+    date_match = labeled_date or _DATE_RE.search(text)
     if date_match:
         report.briefing_date = f"{date_match.group(1)}-{int(date_match.group(2)):02d}-{int(date_match.group(3)):02d}"
 

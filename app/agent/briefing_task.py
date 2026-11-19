@@ -18,7 +18,7 @@ from datetime import date
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agent.context import ToolContext
-from app.agent.llm import LLMError, build_llm_client
+from app.agent.llm import LLMError, build_llm_client, resolve_mode
 from app.agent.loop import AgentRunner
 from app.agent.prompts import build_briefing_prompt
 from app.agent.registry import tool_registry
@@ -77,12 +77,20 @@ async def run_briefing(
         AppError: 模型配置缺失（4xx 类错误，调用方可修正）。
     """
     day = briefing_date or date.today()
-    task = briefing_service.build_briefing_task(profile, day, focus=focus)
 
     try:
         llm = build_llm_client(llm_mode)
     except LLMError as exc:
         raise AppError(str(exc), code=400, status_code=400) from exc
+
+    # 只有真实模型才在简报抬头标注「Agent 模式」。离线策略的抬头由 mock_news 自己写
+    # （明确写「离线策略」），两边各说各的实话，不会出现「跑的是 mock、抬头却写 Agent」。
+    task = briefing_service.build_briefing_task(
+        profile,
+        day,
+        focus=focus,
+        llm_label=settings.LLM_MODEL if resolve_mode(llm_mode) == "openai" else None,
+    )
 
     if workspace is not None:
         ctx = ToolContext(workspace=workspace)
@@ -124,7 +132,9 @@ async def run_briefing(
     return BriefingRunResult(
         record=record,
         briefing=briefing,
-        file_path=_last_written_file(record) or (briefing.file_path if briefing else None),
+        # 入库记录里的 file_path 是 save_briefing 自己算出来并实际落盘的那个，
+        # 比回溯轨迹（旧版本还会 write_file）更可信，所以放在前面。
+        file_path=(briefing.file_path if briefing else None) or _last_written_file(record),
         news_candidates=len(ctx.news_state.items),
         fetched_articles=len(ctx.news_state.fetches),
         searches=list(ctx.news_state.searches),
@@ -133,10 +143,14 @@ async def run_briefing(
 
 
 def _last_written_file(record: RunRecord) -> str | None:
-    """从轨迹里找出最后一次成功的 write_file 目标路径。"""
+    """从轨迹里找出最后一次成功的产出文件路径。
+
+    两个来源：`save_briefing` 的 file_path 参数（当前版本由它自己落盘），
+    以及 `write_file` 的 path（旧轨迹/自定义任务仍可能单独写文件）。
+    """
     for item in reversed(record.tool_calls):
-        if item.tool == "write_file" and item.ok:
-            path = item.arguments.get("path")
+        if item.tool in {"save_briefing", "write_file"} and item.ok:
+            path = item.arguments.get("file_path") or item.arguments.get("path")
             if isinstance(path, str) and path:
                 return path
     return None

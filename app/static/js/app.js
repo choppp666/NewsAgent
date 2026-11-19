@@ -321,7 +321,7 @@
       renderPreferences(data.preferences);
       renderLatestBriefing(data.latest_briefing);
       renderLatestPush(data.latest_push);
-      renderPushSwitch(data.user);
+      renderPushSwitch(data.user, data.push);
       renderScheduler(data.scheduler);
       renderGenState(data);
     } catch (error) {
@@ -441,14 +441,19 @@
     if (btn) btn.addEventListener('click', () => retryPush(push.id, btn));
   }
 
-  function renderPushSwitch(user) {
+  function renderPushSwitch(user, pushInfo) {
     const toggle = $('pushToggle');
     toggle.checked = Boolean(user.push_enabled);
     $('pushToggleLabel').textContent = user.push_enabled ? '接收邮件推送' : '已关闭推送';
 
     const sched = state.dashboard && state.dashboard.scheduler;
+    const missing = (pushInfo && pushInfo.smtp_missing) || [];
     let hint = '';
     if (!user.email) hint = '未填写接收邮箱，打开开关也不会发信';
+    else if (pushInfo && pushInfo.smtp_configured === false) {
+      // 服务端缺配置时最常见的就是「生成好了却收不到」——把缺的具体字段说出来
+      hint = `服务端发件账号未配好（缺少 ${missing.join('、') || 'SMTP 参数'}），简报会正常生成，但不会发信`;
+    } else if (pushInfo && pushInfo.global_enabled === false) hint = '服务端已关闭全局推送（PUSH_ENABLED=false）';
     else if (sched && sched.enabled === false) hint = '服务端已关闭定时任务，仅支持手动生成';
     else hint = `简报生成后发送到 ${user.email}`;
     $('pushHint').textContent = hint;
@@ -1236,7 +1241,8 @@
         toast(enabled ? '已开启邮件推送' : '已关闭邮件推送', 'success');
         if (state.dashboard) {
           state.dashboard.user.push_enabled = data.push_enabled;
-          renderPushSwitch(state.dashboard.user);
+          state.dashboard.push = data;
+          renderPushSwitch(state.dashboard.user, data);
         }
       } catch (error) {
         event.target.checked = !enabled;

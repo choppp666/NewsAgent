@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from app.agent.llm import LLMError, resolve_mode
 from app.api.agent import router as agent_router
 from app.api.v1.router import api_router
 from app.core.config import STATIC_DIR, settings
@@ -62,6 +63,16 @@ async def lifespan(app: FastAPI):
     4. 启动调度器 + 启动补跑 —— 补跑在后台执行，不阻塞「服务已就绪」的信号。
     """
     logger.info("正在启动 %s v%s ...", settings.APP_NAME, settings.APP_VERSION)
+
+    # 模型配置在启动时就要有定论：
+    # - 显式要求真实模型却没有 key：直接启动失败，而不是等生成任务跑到一半才 400；
+    # - auto 降级到离线策略：日志里必须写明，避免「以为在跑真模型，其实在跑模板」。
+    try:
+        resolved_mode = resolve_mode()
+    except LLMError as exc:
+        logger.error("模型配置不可用：%s", exc)
+        raise RuntimeError(f"Agent 模型配置错误：{exc}") from exc
+
     init_db()
     _backfill_task_records()
 
@@ -74,12 +85,21 @@ async def lifespan(app: FastAPI):
 
     logger.info("启动完成 | 前端首页: / | 接口文档: /docs | 配置默认监听: %s:%s", settings.HOST, settings.PORT)
     logger.info(
-        "Agent 已就绪 | 模式=%s | 工作区=%s | 轮数上限=%s | 工具次数上限=%s",
+        "Agent 已就绪 | 配置模式=%s | 实际模式=%s | 模型=%s | 密钥=%s | 工作区=%s | 轮数上限=%s | 工具次数上限=%s",
         settings.AGENT_MODE,
+        resolved_mode,
+        settings.LLM_MODEL if resolved_mode != "mock" else "（离线策略，不调用模型）",
+        settings.llm_key_fingerprint,
         settings.agent_workspace_path,
         settings.AGENT_MAX_STEPS,
         settings.AGENT_MAX_TOOL_CALLS,
     )
+    if resolved_mode == "mock":
+        logger.warning(
+            "当前不会调用真实模型：AGENT_MODE=%s 且未配置 LLM_API_KEY。"
+            "生成的简报会是离线策略模板，排查请检查 .env / .env.local 里的 LLM_API_KEY",
+            settings.AGENT_MODE,
+        )
     logger.info(
         "定时任务 | 启用=%s 时间=%02d:%02d 时区=%s 并发=%s | 邮件推送=%s（SMTP %s）",
         settings.SCHEDULER_ENABLED,
@@ -95,6 +115,15 @@ async def lifespan(app: FastAPI):
     # 关闭顺序与启动相反：先停调度器（不再产生新任务），再停 worker
     await scheduler_manager.shutdown()
     await generation_worker.stop()
+
+    # 释放新闻抓取的共享连接池（否则进程退出时会有未关闭的 socket 警告）
+    try:
+        from app.news.http import close_shared_client
+
+        close_shared_client()
+    except Exception:  # noqa: BLE001 - 关闭阶段失败不影响退出
+        logger.warning("关闭新闻抓取连接池失败", exc_info=True)
+
     logger.info("应用已关闭")
 
 

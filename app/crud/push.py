@@ -10,6 +10,9 @@ from sqlalchemy.orm import Session
 
 from app.models.push import PUSH_TERMINAL_STATUSES, PushChannel, PushRecord, PushStatus
 
+# 判断「跳过原因是服务端配置缺失」的标记：`_blocked_reason` 里的配置类文案都带 SMTP
+CONFIG_SKIP_MARKER = "SMTP"
+
 
 def get(db: Session, push_id: int) -> PushRecord | None:
     """按主键查询。"""
@@ -69,6 +72,29 @@ def list_retryable(db: Session, *, now: datetime, max_attempts: int, limit: int 
             PushRecord.status.notin_(list(PUSH_TERMINAL_STATUSES)),
         )
         .order_by(PushRecord.next_retry_at.asc(), PushRecord.id.asc())
+        .limit(limit)
+    )
+    return list(db.scalars(stmt).all())
+
+
+def list_config_skipped(db: Session, *, since: datetime, limit: int = 50) -> list[PushRecord]:
+    """扫描「因为服务端配置缺失而被跳过」的记录。
+
+    与 `list_retryable` 的区别：这里捞的是终态 skipped 里**原因在服务端**的那部分。
+    因为 skipped 是终态，`list_retryable` 永远不会看它，于是「补上配置后历史简报
+    仍不自动补发」——这正是需要单独扫一遍的理由。
+
+    筛选用 `last_error LIKE '%SMTP%'`：用户侧的原因（未填邮箱、关了开关）
+    文案里不含 SMTP，天然被排除，只有「服务端没配好」的记录会被选中。
+    """
+    stmt = (
+        select(PushRecord)
+        .where(
+            PushRecord.status == PushStatus.SKIPPED.value,
+            PushRecord.last_error.like(f"%{CONFIG_SKIP_MARKER}%"),
+            PushRecord.created_at >= since,
+        )
+        .order_by(PushRecord.id.asc())
         .limit(limit)
     )
     return list(db.scalars(stmt).all())

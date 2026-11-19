@@ -292,4 +292,13 @@ def news_network(monkeypatch: pytest.MonkeyPatch):
         )
 
     monkeypatch.setattr(news_http, "fetch_text", fake_fetch_text)
-    return feeds, articles, meta
+
+    # Provider 带进程内 TTL 缓存，属「跨测试的全局状态」：不清掉的话，
+    # 前一个用例的抓取结果会灌到下一个用例（例如「所有源都挂」的用例
+    # 命中了上一轮成功的缓存，断言就永远失败）。
+    from app.news.providers import get_provider
+
+    provider = get_provider("rss")
+    provider.clear_cache()
+    yield feeds, articles, meta
+    provider.clear_cache()

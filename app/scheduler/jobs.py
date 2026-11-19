@@ -229,15 +229,21 @@ def retry_failed_pushes() -> dict[str, int]:
 
     单独成作业的原因：推送失败往往是临时的（SMTP 连接抖动、被限流），
     而重新生成简报要花几分钟和真金白银。重试只重发同一份已入库的简报。
+
+    先补一轮「配置自愈」（`requeue_config_skipped`）：如果之前是因为服务端没配好
+    SMTP 而被记成 skipped，现在配置补齐了，这些记录应该自己发出去，而不是等用户
+    一条条手动点重试。配置仍未补齐时该函数直接返回 0，不多做一次查询之外的事。
     """
     try:
+        requeued = push_service.requeue_config_skipped()
         stats = push_service.retry_due_pushes()
-        if stats.get("scanned"):
+        stats["requeued"] = requeued
+        if stats.get("scanned") or requeued:
             logger.info("推送重试作业：%s", stats)
         return stats
     except Exception:  # noqa: BLE001 - 作业异常不能带崩调度器
         logger.exception("推送重试作业执行失败")
-        return {"scanned": 0, "succeeded": 0, "failed": 0, "skipped": 0}
+        return {"scanned": 0, "succeeded": 0, "failed": 0, "skipped": 0, "requeued": 0}
 
 
 def recover_stale_tasks_job(max_attempts: int = 3) -> dict[str, object]:

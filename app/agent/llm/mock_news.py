@@ -98,7 +98,6 @@ class NewsPolicy:
         focus, excludes = self._focus(task, observations)
         searches = [obs for obs in observations if obs.name == "search_news"]
         fetches = [obs for obs in observations if obs.name == "fetch_article" and obs.ok]
-        wrote = any(obs.name == "write_file" and obs.ok for obs in observations)
         saved = [obs for obs in observations if obs.name == "save_briefing"]
 
         # ① 先读真实偏好（如果任务里给了 user_id）
@@ -112,7 +111,8 @@ class NewsPolicy:
             term = focus[len(searches)]
             args: dict[str, Any] = {
                 "keyword": term,
-                "date_range": "today",
+                # 与真实模型走同一个时间窗口：早上生成时「今天 0 点后」几乎没有新闻
+                "date_range": "last_24h",
                 "max_items": 6,
             }
             if excludes:
@@ -150,14 +150,13 @@ class NewsPolicy:
         if not candidates:
             return Plan("final", answer=self._empty_answer(task, observations))
 
-        # ⑥ 写文件 → 入库
+        # ⑥ 一次性交付：save_briefing 自己校验 + 入库 + 导出 Markdown。
+        # 这里不再先 write_file 再 save_briefing —— 那会让同一份正文被生成两遍，
+        # 与真实模型的交付路径保持一致（单次调用、单次落盘）。
         selected = self._select(candidates, fetches)
         markdown = self._compose(task, selected, fetches, focus, excludes)
 
         path = self._output_path(task, user_id)
-        if not wrote:
-            return Plan("call", "write_file", {"path": path, "content": markdown, "mode": "overwrite"})
-
         if not any(obs.ok for obs in saved):
             # 入库失败过一次就不再重试（失败原因已经回填给模型/日志）
             if saved:
@@ -366,6 +365,7 @@ class NewsPolicy:
             "> 相关度仅按关键词字面匹配计算，不具备语义判断能力——配置 LLM_API_KEY 后由模型判断相关性。",
             "",
             f"- 简报日期：{day}",
+            "- 覆盖时段：过去 24 小时（截至生成时刻）",
             f"- 用户关注方向：{focus_text}",
             f"- 今日新闻数量：{len(selected)}",
             "",

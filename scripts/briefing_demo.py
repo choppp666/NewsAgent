@@ -134,7 +134,25 @@ async def main() -> None:
     parser.add_argument("--mode", default=None, choices=["auto", "openai", "mock"], help="覆盖 AGENT_MODE")
     parser.add_argument("--date", default=None, help="简报日期 YYYY-MM-DD，默认今天")
     parser.add_argument("--user", default=None, choices=["A", "B"], help="只跑其中一个用户")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="打印 app.* 的 INFO 日志（缓存命中、上下文压缩、RSS 耗时等排查信息）",
+    )
     args = parser.parse_args()
+
+    # 脚本不经过 app/main.py 的日志初始化，默认什么都看不到；
+    # 加 --verbose 才能看到「缓存命中 / 上下文压缩」这类关键观测点
+    if args.verbose:
+        import logging
+
+        logging.basicConfig(
+            level=logging.WARNING,
+            format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+            datefmt="%H:%M:%S",
+        )
+        for name in ("app.agent", "app.news", "app.services"):
+            logging.getLogger(name).setLevel(logging.INFO)
 
     day = date.fromisoformat(args.date) if args.date else date.today()
     init_db()
